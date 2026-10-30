@@ -1,5 +1,3 @@
-import base64
-
 import pytest
 
 from ai_kun.config import (
@@ -19,7 +17,6 @@ from ai_kun.memory import MemoryStore
 @pytest.fixture(autouse=True)
 def isolated_data(tmp_path, monkeypatch):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
-    monkeypatch.setenv("MEMORY_ENCRYPTION_KEY", base64.b64encode(b"a" * 32).decode())
     get_engine.cache_clear()
     yield
     get_engine().dispose()

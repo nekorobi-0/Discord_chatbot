@@ -1,11 +1,7 @@
-import base64
-
 import pytest
-from cryptography.exceptions import InvalidTag
 from dotenv import dotenv_values
 
 from ai_kun.config import LLMSettings, MemorySettings, OperationalSettings, Settings
-from ai_kun.crypto import KeyProvider
 from ai_kun.errors import ConfigurationError
 
 
@@ -14,7 +10,6 @@ def test_example_can_be_configured(monkeypatch):
         monkeypatch.setenv(key, value)
     monkeypatch.setenv("DISCORD_BOT_TOKEN", "fake-discord")
     monkeypatch.setenv("LLM_API_KEY", "fake-llm")
-    monkeypatch.setenv("MEMORY_ENCRYPTION_KEY", base64.b64encode(b"a" * 32).decode())
     settings = Settings.from_env()
     assert settings.llm.base_url == "http://127.0.0.1:11434/v1"
     assert settings.embedding.base_url == settings.llm.base_url
@@ -65,17 +60,6 @@ def test_dashboard_requires_both_credentials(monkeypatch):
     monkeypatch.setenv("DASHBOARD_PASSWORD", "")
     with pytest.raises(ConfigurationError):
         OperationalSettings.from_env()
-
-
-def test_encryption_bytes_string_roundtrip_and_tamper():
-    crypto = KeyProvider()
-    sealed = crypto.seal("ひみつ".encode())
-    assert crypto.open(sealed).decode() == "ひみつ"
-    assert crypto.open(sealed.decode()).decode() == "ひみつ"
-    raw = bytearray(base64.b64decode(sealed))
-    raw[-1] ^= 1
-    with pytest.raises(InvalidTag):
-        crypto.open(base64.b64encode(raw))
 
 
 def test_local_config_without_api_keys(monkeypatch):

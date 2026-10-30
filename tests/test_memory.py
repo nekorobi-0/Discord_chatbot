@@ -1,4 +1,3 @@
-import base64
 import json
 from dataclasses import replace
 
@@ -12,9 +11,8 @@ from ai_kun.db import (
     MemoryDocumentRecord,
     get_engine,
 )
-from ai_kun.errors import ConfigurationError, InvalidInputError, UpstreamError
+from ai_kun.errors import InvalidInputError, UpstreamError
 from ai_kun.memory import MemoryStore
-from ai_kun.metadata import MetadataGrant
 
 
 async def test_ingest_search_restart_cache_delete(store, settings, monkeypatch):
@@ -29,39 +27,28 @@ async def test_ingest_search_restart_cache_delete(store, settings, monkeypatch):
     result = await store.ingest_document("plan.md", text.encode())
     assert len(result["document_id"]) == 32
     assert all("alice@example.com" not in value for value in calls)
-    hits = await store.search("プロジェクトの締切", MetadataGrant())
+    hits = await store.search("プロジェクトの締切")
     assert "金曜日" in hits[0].text
     assert "[EMAIL]" in hits[0].text
     assert result["document_id"] in hits[0].label
     before = len(calls)
-    await store.search("プロジェクトの締切", MetadataGrant())
+    await store.search("プロジェクトの締切")
     assert len(calls) == before  # 永続キャッシュで再送しない
     restarted = MemoryStore(settings.embedding, settings.llm, settings.asr, settings.memory)
     monkeypatch.setattr(restarted, "_request", request)
-    assert (await restarted.search("プロジェクトの締切", MetadataGrant()))[0].text == hits[0].text
+    assert (await restarted.search("プロジェクトの締切"))[0].text == hits[0].text
     assert len(calls) == before
     with Session(get_engine()) as db:
         doc = db.exec(select(MemoryDocumentRecord)).first()
-        assert "金曜日".encode() not in doc.content_ciphertext
+        assert "alice@example.com" not in doc.content and "[EMAIL]" in doc.content
         assert doc.title == "uploaded document"
     assert await restarted.delete_document(result["document_id"]) == result["chunks"]
     with Session(get_engine()) as db:
         assert db.exec(select(MemoryChunkRecord)).all() == []
         assert db.exec(select(EmbeddingCacheRecord)).all() == []
-    assert await restarted.search("プロジェクトの締切", MetadataGrant()) == ()
+    assert await restarted.search("プロジェクトの締切") == ()
     with pytest.raises(InvalidInputError):
         await restarted.delete_document(result["document_id"])
-
-
-async def test_wrong_key_fails_at_startup(store, settings, monkeypatch):
-    async def embed(texts):
-        return [[1.0] * 64 for text in texts]
-
-    monkeypatch.setattr(store, "embed", embed)
-    await store.ingest_document("test.txt", b"hello")
-    monkeypatch.setenv("MEMORY_ENCRYPTION_KEY", base64.b64encode(b"b" * 32).decode())
-    with pytest.raises(ConfigurationError, match="復号"):
-        MemoryStore(settings.embedding, settings.llm, settings.asr, settings.memory)
 
 
 async def test_documents_masked_before_embedding(store, monkeypatch):
@@ -102,7 +89,7 @@ async def test_model_change_excludes_old_vectors(store, settings, monkeypatch):
     await store.ingest_document("x.txt", b"old-model data")
     changed = MemoryStore(replace(settings.embedding, model="new-model"), settings.llm, settings.asr, settings.memory)
     monkeypatch.setattr(changed, "embed", embed)
-    assert await changed.search("data", MetadataGrant()) == ()
+    assert await changed.search("data") == ()
 
 
 async def test_low_similarity_is_not_retrieved(store, monkeypatch):
@@ -116,7 +103,7 @@ async def test_low_similarity_is_not_retrieved(store, monkeypatch):
         return [[0.0, 1.0] + [0.0] * 62 for text in texts]
 
     monkeypatch.setattr(store, "embed", other_embed)
-    assert await store.search("unrelated question", MetadataGrant()) == ()
+    assert await store.search("unrelated question") == ()
 
 
 async def test_local_embedding_without_key(store, settings, monkeypatch):

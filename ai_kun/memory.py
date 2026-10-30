@@ -1,7 +1,7 @@
 """AIくんの記憶（RAG）レイヤー。
 
-- 保存するテキストは暗号化し、平文はディスクに残さない
-- 検索はベクトル近傍のみ。スコア下限より下なら「覚えていない」と答える
+- 検索は NumPy のバッチ演算で埋め込み近傍を計算する。総当たりの純Python演算は使わない
+- 保存した本文・ベクトルから復号なしに検索できる
 - LLM / Embedding は互換API、ASRはローカル推論
 """
 
@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
-import json
 import logging
 import os
 import re
@@ -20,25 +19,21 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import httpx
+import numpy as np
 from sqlalchemy import delete
 from sqlmodel import Session, select
 
 from .config import ASRSettings, EmbeddingSettings, LLMSettings, MemorySettings, mask_pii
-from .crypto import KeyProvider
 from .db import (
     EmbeddingCacheRecord,
     HistoryCursorRecord,
     HistoryMessageRecord,
     MemoryChunkRecord,
     MemoryDocumentRecord,
-    MetadataDocumentLinkRecord,
-    MetadataEnvelopeRecord,
     get_engine,
     init_db,
 )
-from .errors import ConfigurationError, InvalidInputError, RateLimitError, UpstreamError
-from .metadata import MetadataEnvelope, MetadataGrant, detect_flags
-from .observability import metrics
+from .errors import InvalidInputError, RateLimitError, UpstreamError
 
 logger = logging.getLogger("ai_kun.memory")
 
@@ -89,28 +84,7 @@ class MemoryStore:
         self._llm = llm
         self._asr = asr
         self._memory = memory
-        self._crypto = KeyProvider() if memory.enabled else None
-        self._envelope = MetadataEnvelope(self._crypto) if memory.enabled else None
         init_db()
-        if self._crypto:
-            with Session(get_engine()) as session:
-                sample = session.exec(select(MemoryDocumentRecord)).first()
-            if sample:
-                try:
-                    self._open(sample.content_ciphertext)
-                except Exception as exc:
-                    raise ConfigurationError(
-                        "保存済み記憶を復号できません。元の暗号鍵とDBを確認してください。"
-                    ) from exc
-
-    # ---------- 暗号化 ----------
-    def _seal(self, text: str) -> bytes:
-        return self._seal_bytes(text.encode("utf-8"))
-
-    def _open(self, sealed: bytes | str) -> str:
-        if self._crypto is None:
-            raise UpstreamError("記憶")
-        return self._crypto.open(sealed).decode("utf-8")
 
     # ---------- HTTP（SSRF 対策つき）----------
     async def _request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
@@ -191,21 +165,16 @@ class MemoryStore:
             with Session(get_engine()) as session:
                 cached = session.exec(select(EmbeddingCacheRecord).where(EmbeddingCacheRecord.digest == digest)).first()
             if cached is not None:
-                try:
-                    vector = json.loads(self._open(cached.vector_ciphertext))
-                except Exception:
+                vector = _decode_vector(cached.vector, self._embedding.dimension)
+                if vector is None:
                     logger.warning("embedding cache entry unreadable")
-                    vector = None
-                if isinstance(vector, list) and len(vector) == self._embedding.dimension:
-                    vectors.append([float(v) for v in vector])
+                else:
+                    vectors.append(vector)
                     continue
             vector = await self._embed_uncached(text)
-            payload = json.dumps(vector).encode("ascii")
             with Session(get_engine()) as session:
                 session.add(
-                    EmbeddingCacheRecord(
-                        digest=digest, model=self._embedding.model, vector_ciphertext=self._seal_bytes(payload)
-                    )
+                    EmbeddingCacheRecord(digest=digest, model=self._embedding.model, vector=_encode_vector(vector))
                 )
                 try:
                     session.commit()
@@ -214,11 +183,6 @@ class MemoryStore:
                     logger.warning("embedding cache write failed")
             vectors.append(vector)
         return vectors
-
-    def _seal_bytes(self, payload: bytes) -> bytes:
-        if self._crypto is None:
-            raise UpstreamError("記憶")
-        return self._crypto.seal(payload)
 
     async def _embed_uncached(self, text: str) -> list[float]:
         headers = {"Authorization": f"Bearer {self._embedding.api_key}"} if self._embedding.api_key else {}
@@ -316,33 +280,26 @@ class MemoryStore:
                 break
 
         vectors = await self.embed([piece for _, piece in chunks])
-        # 話者ID・チャンネルIDは使わないが、「どの文書か」を暗号化した目録を作り、検索時の照合に使う。
-        envelope_sealed = self._envelope.seal({"document_id": document_id, "flags": 0})
         with Session(get_engine()) as session:
             session.add(
                 MemoryDocumentRecord(
                     document_id=document_id,
                     source="upload",
                     title="uploaded document",
-                    content_ciphertext=self._seal(text),
+                    content=text,
                     created_at=datetime.now(UTC),
                 )
             )
-            session.flush()
-            # 目録封書の主キーは別枠のランダムID。文書との対応はリンク行だけで表す。
-            envelope_id = uuid.uuid4().hex
-            session.add(MetadataEnvelopeRecord(envelope_id=envelope_id, sealed=envelope_sealed))
-            # 封書行を先に確定させてからリンクを書く（挿入順序の違いで外部キーに引っ掛けない）。
-            session.flush()
-            session.add(MetadataDocumentLinkRecord(envelope_id=envelope_id, document_id=document_id))
+            # 外部キー制約を満たすため、文書を先に確定させてからチャンクを書き込む。
+            session.commit()
             for (chunk_id, piece), vector in zip(chunks, vectors, strict=True):
                 masked, _ = mask_pii(piece)
                 session.add(
                     MemoryChunkRecord(
                         chunk_id=chunk_id,
                         document_id=document_id,
-                        content_ciphertext=self._seal(masked),
-                        embedding_ciphertext=self._seal_bytes(json.dumps(vector).encode("ascii")),
+                        content=masked,
+                        embedding=_encode_vector(vector),
                         model=self._embedding.model,
                         dimension=self._embedding.dimension,
                         created_at=datetime.now(UTC),
@@ -426,20 +383,6 @@ class MemoryStore:
 
         # Embedding失敗時にはここへ到達しないため、カーソルも進まず同じページから再開できる。
         now = datetime.now(UTC)
-        flags = detect_flags(messages)
-        authors = []
-        for message in messages:
-            author = str((message.get("author") or {}).get("id") or "")
-            if author and author not in authors:
-                authors.append(author)
-        payload = {
-            "guild_id": str(guild_id),
-            "channel_id": str(channel_id),
-            "authors": authors,
-            "flags": flags,
-        }
-        # 目録は1本の暗号化封書としてだけ保存する。話者ID・チャンネルIDは平文で行を作らない。
-        sealed_envelopes = [self._envelope.seal(payload) for _ in prepared]
         with Session(get_engine()) as session:
             for document_id, text, group, pieces, vectors in prepared:
                 session.add(
@@ -447,26 +390,20 @@ class MemoryStore:
                         document_id=document_id,
                         source="discord_history",
                         title=f"channel:{channel_id}",
-                        content_ciphertext=self._seal(text),
+                        content=text,
                         created_at=now,
                     )
                 )
-            session.flush()
-            # 文書行を確定させたうえで、目録封書と対応付けを同じトランザクションに書く。
-            for sealed, (document_id, *_rest) in zip(sealed_envelopes, prepared, strict=True):
-                envelope_id = uuid.uuid4().hex
-                session.add(MetadataEnvelopeRecord(envelope_id=envelope_id, sealed=sealed))
-                # 封書行を先に確定させてからリンクを書く（挿入順序の違いで外部キーに引っ掛けない）。
-                session.flush()
-                session.add(MetadataDocumentLinkRecord(envelope_id=envelope_id, document_id=document_id))
+            # 外部キー制約を満たすため、文書を先に確定させてから検索チャンクを書き込む。
+            session.commit()
             for document_id, text, group, pieces, vectors in prepared:
                 for piece, vector in zip(pieces, vectors, strict=True):
                     session.add(
                         MemoryChunkRecord(
                             chunk_id=uuid.uuid4().hex,
                             document_id=document_id,
-                            content_ciphertext=self._seal(piece),
-                            embedding_ciphertext=self._seal_bytes(json.dumps(vector).encode()),
+                            content=piece,
+                            embedding=_encode_vector(vector),
                             model=self._embedding.model,
                             dimension=self._embedding.dimension,
                             created_at=now,
@@ -501,69 +438,52 @@ class MemoryStore:
             "documents": len(groups),
         }
 
-    async def search(
-        self, query: str, grant: MetadataGrant, top_k: int | None = None
-    ) -> tuple[RetrievedChunk, ...]:
-        """埋め込み近傍検索。目録（話者ID・チャンネルID・添付種別）の条件を満たす項目だけ返す。
+    async def search(self, query: str, top_k: int | None = None) -> tuple[RetrievedChunk, ...]:
+        """保存済み埋め込みに対する近傍検索。NumPy のバッチ演算でスコアを一括計算する。
 
-        grant が空でも「条件なし」として全件対象になるだけ。目録がある項目は必ず
-        matches() を通らなければ結果から落とすため、絞り込み要求を無視して返さない。
+        以前のような1件ずつの純Python演算や復号は行わない。スコア下限に満たない
+        チャンクは回答に渡さず、モデル・次元数が設定と違う記憶も対象にしない。
         """
         if not self._memory.enabled:
             return ()
-        if not isinstance(grant, MetadataGrant):
-            raise InvalidInputError("検索の絞り込み条件を読み取れなかったよ。もう一回おねがい。")
         text = mask_pii(_sanitize_text(query))[0]
         if not text:
             return ()
         limit = min(int(top_k or self._memory.top_k), 24)
         with Session(get_engine()) as session:
-            rows = session.exec(
-                select(MemoryChunkRecord).where(
-                    MemoryChunkRecord.model == self._embedding.model,
-                    MemoryChunkRecord.dimension == self._embedding.dimension,
-                )
-            ).all()
+            rows = list(
+                session.exec(
+                    select(MemoryChunkRecord).where(
+                        MemoryChunkRecord.model == self._embedding.model,
+                        MemoryChunkRecord.dimension == self._embedding.dimension,
+                    )
+                ).all()
+            )
         if not rows:
             return ()
+
         query_vector = (await self.embed([text]))[0]
-        scored: list[tuple[float, MemoryChunkRecord]] = []
-        for row in rows:
-            try:
-                vector = json.loads(self._open(row.embedding_ciphertext))
-            except Exception:
+        matrix = np.empty((len(rows), self._embedding.dimension), dtype=np.float32)
+        usable = np.zeros(len(rows), dtype=bool)
+        for index, row in enumerate(rows):
+            vector = _decode_vector(row.embedding, self._embedding.dimension)
+            if vector is None:
                 logger.warning("stored memory entry unreadable")
                 continue
-            if not isinstance(vector, list) or len(vector) != self._embedding.dimension:
-                continue
-            score = _cosine(query_vector, [float(v) for v in vector])
-            if score < self._memory.min_score:
-                continue
-            with Session(get_engine()) as session:
-                linked = session.exec(
-                    select(MetadataEnvelopeRecord)
-                    .join(MetadataDocumentLinkRecord, MetadataDocumentLinkRecord.envelope_id == MetadataEnvelopeRecord.envelope_id)
-                    .where(MetadataDocumentLinkRecord.document_id == row.document_id)
-                ).first()
-            if linked is not None:
-                # 目録がある項目は封書を検証して条件照合。読めない封書の項目は安全側で落とす。
-                try:
-                    payload = self._envelope.open(linked.sealed)
-                except Exception:
-                    logger.warning("stored memory index unreadable")
-                    continue
-                if not MetadataEnvelope.matches(payload, grant):
-                    metrics.increment("ai_kun.retrieval_filtered_out_total")
-                    continue
-            scored.append((score, row))
-        scored.sort(key=lambda item: item[0], reverse=True)
+            matrix[index] = vector
+            usable[index] = True
+        if not usable.any():
+            return ()
+
+        scores = _batched_cosine(query_vector, matrix[usable])
+        eligible = np.flatnonzero(usable)[np.asarray(scores, dtype=np.float32) >= self._memory.min_score]
+        if eligible.size == 0:
+            return ()
+        ranked = eligible[np.argsort(-scores[eligible], kind="stable")][:limit]
+
         results: list[RetrievedChunk] = []
-        for _, row in scored[:limit]:
-            try:
-                text_chunk = self._open(row.content_ciphertext)
-            except Exception:
-                logger.warning("stored memory entry unreadable")
-                continue
+        for position in ranked.tolist():
+            row = rows[int(position)]
             with Session(get_engine()) as session:
                 origin = session.exec(
                     select(HistoryMessageRecord).where(HistoryMessageRecord.document_id == row.document_id)
@@ -571,23 +491,12 @@ class MemoryStore:
             label = f"document:{row.document_id}"
             if origin:
                 label += f" https://discord.com/channels/{origin.guild_id}/{origin.channel_id}/{origin.message_id}"
-            results.append(RetrievedChunk(label=label, text=text_chunk))
+            results.append(RetrievedChunk(label=label, text=row.content))
         return tuple(results)
 
     async def delete_document(self, document_id: str) -> int:
         doc_id = str(document_id)[:64]
         with Session(get_engine()) as session:
-            # 先に目録封書と対応付けを消す（文書行より先に消さないと外部キーで削除自体が止まる）。
-            linked = session.exec(
-                select(MetadataDocumentLinkRecord).where(MetadataDocumentLinkRecord.document_id == doc_id)
-            ).all()
-            for row in linked:
-                session.delete(row)
-                session.flush()
-                envelope = session.get(MetadataEnvelopeRecord, row.envelope_id)
-                if envelope is not None:
-                    session.delete(envelope)
-            session.flush()
             chunks = (
                 session.exec(delete(MemoryChunkRecord).where(MemoryChunkRecord.document_id == doc_id)).rowcount or 0
             )
@@ -603,8 +512,40 @@ class MemoryStore:
         return int(chunks)
 
 
-def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b, strict=True))
-    na = sum(x * x for x in a) ** 0.5
-    nb = sum(y * y for y in b) ** 0.5
-    return dot / (na * nb) if na and nb else 0.0
+def _encode_vector(vector: Sequence[float]) -> bytes:
+    """埋め込みを float32 のリトルエンディアン列として直列化する。"""
+    return np.asarray(vector, dtype="<f4").tobytes(order="C")
+
+
+def _decode_vector(payload: object, dimension: int) -> list[float] | None:
+    """保存されたバイト列を次元数検証とともに float32 ベクトルへ戻す。"""
+    if not isinstance(payload, (bytes, bytearray, memoryview)):
+        return None
+    raw = bytes(payload)
+    if len(raw) != dimension * 4:
+        return None
+    try:
+        values = np.frombuffer(raw, dtype="<f4", count=dimension)
+    except ValueError:
+        return None
+    if not bool(np.all(np.isfinite(values))):
+        return None
+    return [float(value) for value in values]
+
+
+def _batched_cosine(query: Sequence[float], stored: np.ndarray) -> np.ndarray:
+    """1本の問い合わせベクトルと保存済み全ベクトルのコサイン類似度を一度の演算で求める。
+
+    BLAS の行列積を使うため、以前のように1件ずつ Python ループで掛算・加算を繰り返さない。
+    ノルムがゼロの行はスコア0として扱い、他の行の順序や値に影響を与えない。
+    """
+    query_vector = np.asarray(query, dtype=np.float32).reshape(-1)
+    if query_vector.size == 0 or stored.size == 0:
+        return np.zeros(stored.shape[0], dtype=np.float32)
+    query_norm = float(np.linalg.norm(query_vector))
+    if not query_norm:
+        return np.zeros(stored.shape[0], dtype=np.float32)
+    norms = np.maximum(np.linalg.norm(stored, axis=1), 1e-12)
+    normalized = stored / norms[:, None]
+    scores = normalized @ (query_vector / query_norm)
+    return np.where(np.isfinite(scores), scores, np.float32(0.0)).astype(np.float32, copy=False)

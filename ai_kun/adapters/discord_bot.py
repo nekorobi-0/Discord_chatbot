@@ -112,39 +112,14 @@ class AIKunClient(discord.Client):
 
             await self._answer(interaction, operation)
 
-        @self.tree.command(
-            name="search_memory",
-            description="記憶を話者・チャンネル・添付ファイルの有無で絞り込んで検索する（管理者）",
-        )
+        @self.tree.command(name="search_memory", description="保存記憶を検索して管理者にだけ表示する")
         @app_commands.default_permissions(manage_guild=True)
         @app_commands.checks.has_permissions(manage_guild=True)
         @app_commands.checks.cooldown(1, 5, key=lambda i: i.user.id)
-        @app_commands.describe(
-            query="検索語",
-            user_ids="話者ユーザーIDで絞り込む（カンマ区切り・最大32件）",
-            channel_ids="チャンネルIDで絞り込む（カンマ区切り・最大32件）",
-            has_image="画像添付のある記録だけを探す",
-            has_video="動画添付のある記録だけを探す",
-            has_other_file="音声・その他のファイル添付のある記録だけを探す",
-        )
-        async def search_memory(
-            interaction: discord.Interaction,
-            query: str,
-            user_ids: str = "",
-            channel_ids: str = "",
-            has_image: bool = False,
-            has_video: bool = False,
-            has_other_file: bool = False,
-        ):
+        @app_commands.describe(query="検索語")
+        async def search_memory(interaction: discord.Interaction, query: str):
             async def operation():
-                grant = self.service.build_grant(
-                    user_ids=user_ids,
-                    channel_ids=channel_ids,
-                    has_image=has_image,
-                    has_video=has_video,
-                    has_other_file=has_other_file,
-                )
-                items = await self.service.search_memory(query, grant)
+                items = await self.service.search_memory(query)
                 if not items:
                     return "条件に合う記憶は見つからなかったよ。"
                 return "\n\n".join(f"〔{item.label}〕\n{item.text}" for item in items)
