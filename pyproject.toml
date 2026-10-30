@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ai-kun-discord"
+version = "0.1.0"
+description = "Discord向け日本語RAGチャットボット"
+requires-python = ">=3.11,<3.15"
+dependencies = [
+  "discord.py>=2.6,<3", "httpx>=0.28,<1", "cryptography>=45,<48",
+  "sqlmodel>=0.0.24,<0.1", "python-dotenv>=1.1,<2", "aiohttp>=3.12,<4",
+]
+
+[project.optional-dependencies]
+asr = ["faster-whisper>=1.2,<2"]
+dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "ruff>=0.12,<1"]
+
+[project.scripts]
+ai-kun = "ai_kun.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ai_kun"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

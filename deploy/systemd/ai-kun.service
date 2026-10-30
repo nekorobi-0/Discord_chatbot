@@ -1,0 +1,22 @@
+[Unit]
+Description=AI-kun Discord RAG Bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# 導入先とユーザーを実環境に合わせて変更する
+User=ai-kun
+WorkingDirectory=/opt/ai-kun
+ExecStart=/opt/ai-kun/.venv/bin/python -m ai_kun --env-file /opt/ai-kun/.env
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/ai-kun/data
+
+[Install]
+WantedBy=multi-user.target

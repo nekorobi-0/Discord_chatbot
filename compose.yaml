@@ -1,0 +1,26 @@
+x-runtime: &runtime
+  image: ai-kun-discord:local
+  build: .
+  env_file: .env
+  environment:
+    DATA_DIR: /app/data
+    ASR_MODEL_PATH: /app/data/asr-model
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  volumes:
+    - bot-data:/app/data
+  init: true
+  stop_grace_period: 30s
+
+services:
+  bot:
+    <<: *runtime
+    restart: unless-stopped
+  history-import:
+    <<: *runtime
+    profiles: [tools]
+    command: [python, -m, ai_kun, --import-history]
+    restart: "no"
+
+volumes:
+  bot-data:

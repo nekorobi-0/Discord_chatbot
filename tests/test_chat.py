@@ -1,0 +1,182 @@
+from dataclasses import replace
+
+import httpx
+import pytest
+
+from ai_kun.chat import ChatService, _is_memory_opt_out
+from ai_kun.errors import InvalidInputError, RateLimitError, UpstreamError
+from ai_kun.memory import ModelTurn, ToolCall
+
+
+async def test_reply_end_to_end_mock_api(settings, store, monkeypatch):
+    sent = []
+
+    async def request(method, url, **kwargs):
+        sent.append(kwargs["json"])
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "こんにちは！"}}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 10},
+            },
+        )
+
+    monkeypatch.setattr(store, "_request", request)
+    service = ChatService(settings, store)
+    result = await service.generate_reply("連絡先は alice@example.com です")
+    assert result.content == "こんにちは！"
+    assert result.pii_masked_count == 1
+    assert "alice@example.com" not in str(sent)
+    assert len(sent[0]["messages"]) == 2
+    await service.generate_reply("こんにちは")
+    assert len(sent[1]["messages"]) == 2  # 履歴を追加しない
+
+
+async def test_tool_round_trip(settings, store, monkeypatch):
+    service = ChatService(replace(settings, search=replace(settings.search, enabled=True, api_key="test")), store)
+    messages_seen = []
+    turns = iter(
+        [
+            ModelTurn(tool_calls=(ToolCall("call-1", "web_search", '{"query":"天気"}'),)),
+            ModelTurn(content="検索結果です"),
+        ]
+    )
+
+    async def complete(messages, **kwargs):
+        messages_seen.append([dict(message) for message in messages])
+        return next(turns)
+
+    async def execute(name, args):
+        assert name == "web_search" and args == {"query": "天気"}
+        return '{"untrusted_data": []}'
+
+    monkeypatch.setattr(store, "complete_chat", complete)
+    monkeypatch.setattr(service._tools, "execute", execute)
+    assert (await service.generate_reply("今日の天気を検索して")).content == "検索結果です"
+    assert messages_seen[1][-1]["role"] == "tool"
+    assert messages_seen[1][-1]["tool_call_id"] == "call-1"
+
+
+async def test_rag_failure_still_replies(settings, store, monkeypatch):
+    async def search(*args, **kwargs):
+        raise UpstreamError("記憶")
+
+    async def complete(messages, **kwargs):
+        assert len(messages) == 2
+        return ModelTurn(content="今は資料を参照できません。")
+
+    monkeypatch.setattr(store, "search", search)
+    monkeypatch.setattr(store, "complete_chat", complete)
+    assert (await ChatService(settings, store).generate_reply("資料を教えて")).content
+
+
+async def test_rag_context(settings, store, monkeypatch):
+    async def embed(texts):
+        return [[1.0] * 64 for text in texts]
+
+    async def complete(messages, **kwargs):
+        assert "金曜" in messages[1]["content"]
+        return ModelTurn(content="金曜です。")
+
+    monkeypatch.setattr(store, "embed", embed)
+    monkeypatch.setattr(store, "complete_chat", complete)
+    service = ChatService(settings, store)
+    result = await service.remember("プロジェクトの締切は金曜")
+    reply = await service.generate_reply("プロジェクトの締切は？")
+    assert reply.citations == (f"document:{result['document_id']}",)
+
+
+async def test_output_limit_and_masking(settings, store, monkeypatch):
+    async def complete(*args, **kwargs):
+        return ModelTurn(content="alice@example.com " + "あ" * 3000)
+
+    monkeypatch.setattr(store, "complete_chat", complete)
+    result = await ChatService(settings, store).generate_reply("こんにちは")
+    assert len(result.content) <= settings.operational.max_output_chars
+    assert result.truncated and "alice@" not in result.content
+
+
+@pytest.mark.parametrize("content", ["", " " * 4, "x" * 8001])
+async def test_invalid_input(settings, store, content):
+    with pytest.raises(InvalidInputError):
+        await ChatService(settings, store).generate_reply(content)
+
+
+@pytest.mark.parametrize("content", ["覚えないで", "memory off", "do not learn", "学習しないで"])
+async def test_opt_out(settings, store, monkeypatch, content):
+    assert _is_memory_opt_out(content)
+    with pytest.raises(InvalidInputError):
+        await ChatService(settings, store).remember(content)
+
+    async def search(*args, **kwargs):
+        pytest.fail("opt out must skip retrieval")
+
+    async def complete(*args, **kwargs):
+        return ModelTurn(content="保存しません。")
+
+    monkeypatch.setattr(store, "search", search)
+    monkeypatch.setattr(store, "complete_chat", complete)
+    await ChatService(settings, store).generate_reply(content + " 資料")
+
+
+async def test_tool_loop_is_bounded(settings, store, monkeypatch):
+    async def complete(*args, **kwargs):
+        return ModelTurn(tool_calls=(ToolCall("x", "unknown", "{}"),))
+
+    monkeypatch.setattr(store, "complete_chat", complete)
+    with pytest.raises(UpstreamError):
+        await ChatService(settings, store).generate_reply("こんにちは")
+
+
+@pytest.mark.parametrize("status,error", [(429, RateLimitError), (401, UpstreamError), (500, UpstreamError)])
+async def test_upstream_errors(settings, store, monkeypatch, status, error):
+    async def request(*args, **kwargs):
+        return httpx.Response(status, json={"error": "private upstream details"})
+
+    monkeypatch.setattr(store, "_request", request)
+    with pytest.raises(error) as caught:
+        await ChatService(settings, store).generate_reply("こんにちは")
+    assert "private" not in caught.value.user_message()
+
+
+async def test_real_http_client_with_mock_transport(settings, store, monkeypatch):
+    captured = []
+
+    def handler(request):
+        assert request.url == "https://llm.example/v1/chat/completions"
+        assert request.headers["Authorization"] == "Bearer test-key"
+        captured.append(request.content)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "応答"}}]})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    assert (await ChatService(settings, store).generate_reply("こんにちは")).content == "応答"
+    assert len(captured) == 1
+
+
+async def test_local_llm_without_key_and_without_budget(settings, store, monkeypatch):
+    import os
+    from pathlib import Path
+
+    monkeypatch.setenv("DAILY_TOKEN_BUDGET", "1")  # 古い環境設定も生成を制限しない
+    store._llm = replace(settings.llm, base_url="http://127.0.0.1:11434/v1", api_key="")
+    calls = []
+
+    def handler(request):
+        assert "Authorization" not in request.headers
+        calls.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "応答"}}],
+                "usage": {"prompt_tokens": 9_000_000, "completion_tokens": 100},
+            },
+        )
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    service = ChatService(settings, store)
+    for _ in range(2):
+        assert (await service.generate_reply("こんにちは")).content == "応答"
+    assert len(calls) == 2
+    assert not (Path(os.environ["DATA_DIR"]) / "budget.sqlite3").exists()
