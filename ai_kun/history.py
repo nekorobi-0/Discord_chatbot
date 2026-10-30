@@ -90,7 +90,7 @@ class HalfRateLimiter:
         if not limit or reset <= 0:
             # 上限不明のときはバーストしない。
             bucket.next_at = now + max(2.0, bucket.window * 2 / bucket.limit)
-            self.global_next = max(self.global_next, now + 2.0)
+            # ヘッダー不明の待機は当該routeだけ。別チャンネルまで止めない。
             return
         if now >= bucket.reset_at or abs(bucket.reset_at - (now + reset)) > 0.5:
             bucket.used = 0
@@ -139,8 +139,14 @@ class DiscordHistoryAPI:
             if before is not None:
                 params["before"] = str(before)
         major = str(channel_id)
+        parts = str(resource).split("/")
+        if len(parts) == 4 and parts[0] == "channels" and parts[2] == "messages":
+            # メッセージIDをmajorにすると、同一チャンネルでも別bucketになってしまう。
+            route, major = "message", parts[1]
         for attempt in range(5):
+            started = time.monotonic()
             await self.limiter.wait(route, major)
+            sent = time.monotonic()
             try:
                 response = await self.client.get(
                     API + path,
@@ -150,6 +156,13 @@ class DiscordHistoryAPI:
             except httpx.TransportError:
                 self.limiter.defer(route, major, 2**attempt, True)
                 continue
+            logger.info(
+                "Discord API GET: route=%s wait_seconds=%.3f request_seconds=%.3f status=%d",
+                route,
+                sent - started,
+                time.monotonic() - sent,
+                response.status_code,
+            )
             self.limiter.observe(route, major, response.headers)
             if response.status_code == 429:
                 try:

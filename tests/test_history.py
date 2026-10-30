@@ -344,3 +344,30 @@ async def test_duplicate_ids_inside_one_page_are_saved_once(embedded):
     assert result["skipped"] == 1
     with Session(get_engine()) as session:
         assert len(session.exec(select(HistoryMessageRecord)).all()) == 2
+
+
+async def test_unknown_bucket_does_not_delay_unrelated_routes():
+    clock = Clock()
+    limiter = HalfRateLimiter(clock, clock.sleep)
+    await limiter.wait("resource", "123")
+    limiter.observe("resource", "123", httpx.Headers())
+    await limiter.wait("messages", "456")
+    assert clock.now == pytest.approx(0.04)  # 修正前は2秒。
+    await limiter.wait("resource", "123")
+    assert clock.now == pytest.approx(2)  # 元のrouteは従来どおり待つ。
+
+
+async def test_single_message_ids_share_channel_bucket():
+    clock = Clock()
+    limiter = HalfRateLimiter(clock, clock.sleep)
+    times = []
+
+    def handler(request):
+        times.append(clock.now)
+        return httpx.Response(200, headers=headers(), json={"id": request.url.path.split("/")[-1]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        api = DiscordHistoryAPI("fake", client, limiter)
+        await api.get("channels/12345/messages/50001")
+        await api.get("channels/12345/messages/50002")
+    assert times == [0, 2]

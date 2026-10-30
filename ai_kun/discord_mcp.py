@@ -4,8 +4,11 @@ import asyncio
 import json
 import logging
 import re
+import time
 from contextlib import asynccontextmanager
 from datetime import timedelta
+from pathlib import PurePosixPath
+from urllib.parse import urlparse
 
 import httpx
 from dotenv import load_dotenv
@@ -13,11 +16,13 @@ from mcp import ClientSession
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.shared.memory import create_client_server_memory_streams
-from mcp.types import CallToolResult, TextContent, Tool, ToolAnnotations
+from mcp.types import CallToolResult, ImageContent, TextContent, Tool, ToolAnnotations
 
 from .config import DiscordSettings
 from .errors import AIKunError, InvalidInputError
 from .history import DiscordHistoryAPI, shared_limiter
+from .images import IMAGE_EXTENSIONS, image_data_url
+from .tool_result import ToolResult
 
 logger = logging.getLogger(__name__)
 _ID = {"type": "string", "pattern": "^[0-9]{5,25}$"}
@@ -108,9 +113,12 @@ def paged_items(rows: list[dict], arguments: dict, key: str) -> dict:
 
 
 class DiscordReader:
-    def __init__(self, settings: DiscordSettings, *, api=None):
+    def __init__(self, settings: DiscordSettings, *, api=None, image_transport=None, clock=time.monotonic):
         self.settings = settings
         self.api = api
+        self.image_transport = image_transport
+        self.clock = clock
+        self._channels = {}
 
     @asynccontextmanager
     async def connection(self):
@@ -121,9 +129,16 @@ class DiscordReader:
                 yield DiscordHistoryAPI(self.settings.bot_token, client, shared_limiter)
 
     async def channel(self, api, channel_id):
+        cached = self._channels.get(channel_id)
+        if cached is not None and cached[0] > self.clock():
+            return cached[1]
         channel = await api.get(channel_id)
         if str(channel.get("guild_id")) != str(self.settings.guild_id):
             raise InvalidInputError("設定されたサーバー以外のチャンネルやDMは読み取れません。")
+        # 所属情報だけを60秒再利用。本文・権限エラーはキャッシュしない。
+        if len(self._channels) >= 1024:
+            self._channels.clear()
+        self._channels[channel_id] = (self.clock() + 60, channel)
         return channel
 
     def message(self, data, channel_id):
@@ -146,11 +161,80 @@ class DiscordReader:
                     "filename": str(item.get("filename", ""))[:256],
                     "size": item.get("size"),
                     "content_type": str(item.get("content_type") or "")[:100],
+                    "url": str(item.get("url") or ""),
                 }
                 for item in (data.get("attachments") or [])[:10]
             ],
             "url": f"https://discord.com/channels/{self.settings.guild_id}/{channel_id}/{message_id}",
         }
+
+    async def image_contents(self, data: dict) -> list:
+        """所属確認済みメッセージの画像のみ。失敗しても本文は返す。"""
+        messages = data.get("messages", [data["message"]] if "message" in data else [])
+        selected = []
+        for message in messages:
+            for attachment in message.get("attachments", []):
+                if PurePosixPath(attachment["filename"]).suffix.lower() not in IMAGE_EXTENSIONS:
+                    continue
+                if len(selected) >= 4:
+                    attachment["image_status"] = "omitted: maximum 4 images per call"
+                    continue
+                selected.append((message["id"], attachment))
+        if not selected:
+            return []
+        async with httpx.AsyncClient(timeout=8, follow_redirects=False, transport=self.image_transport) as client:
+
+            async def fetch(message_id, attachment):
+                parsed = urlparse(attachment["url"])
+                if (
+                    parsed.scheme != "https"
+                    or parsed.hostname not in {"cdn.discordapp.com", "media.discordapp.net"}
+                    or parsed.port not in (None, 443)
+                    or parsed.username is not None
+                    or not parsed.path.startswith("/attachments/")
+                ):
+                    attachment["image_status"] = "unavailable: invalid CDN URL"
+                    return []
+                try:
+                    if int(attachment.get("size") or 0) > 8 * 1024 * 1024:
+                        raise InvalidInputError("画像は8MiBまで")
+                    async with client.stream("GET", attachment["url"]) as response:
+                        response.raise_for_status()
+                        blob = bytearray()
+                        async for chunk in response.aiter_bytes():
+                            blob.extend(chunk)
+                            if len(blob) > 8 * 1024 * 1024:
+                                raise InvalidInputError("画像は8MiBまで")
+                    uri = image_data_url(bytes(blob))
+                    header, encoded = uri.split(",", 1)
+                    attachment["image_status"] = "included"
+                    return [
+                        TextContent(
+                            type="text",
+                            text=json.dumps(
+                                {
+                                    "message_id": message_id,
+                                    "filename": attachment["filename"],
+                                    "source": "untrusted Discord attachment",
+                                },
+                                ensure_ascii=False,
+                            ),
+                        ),
+                        ImageContent(type="image", mimeType=header[5:].split(";")[0], data=encoded),
+                    ]
+                except (httpx.HTTPError, AIKunError, ValueError):
+                    attachment["image_status"] = "unavailable: download or image format error"
+                    return []
+
+            async def bounded_fetch(message_id, attachment):
+                try:
+                    return await asyncio.wait_for(fetch(message_id, attachment), timeout=10)
+                except (TimeoutError, ValueError):
+                    attachment["image_status"] = "unavailable: timeout or invalid URL"
+                    return []
+
+            results = await asyncio.gather(*(bounded_fetch(*item) for item in selected))
+        return [part for result in results for part in result]
 
     async def read(self, name: str, arguments: dict) -> dict:
         if name not in {tool.name for tool in DISCORD_TOOLS}:
@@ -228,8 +312,22 @@ def create_server(reader: DiscordReader) -> Server:
     @server.call_tool()
     async def call_tool(name, arguments):
         try:
+            started = time.monotonic()
             data = await reader.read(name, arguments)
-            return {"untrusted_data": data}
+            read_seconds = time.monotonic() - started
+            images = await reader.image_contents(data)
+            logger.info(
+                "Discord MCP %s: read_seconds=%.3f image_seconds=%.3f images=%d",
+                name,
+                read_seconds,
+                time.monotonic() - started - read_seconds,
+                sum(part.type == "image" for part in images),
+            )
+            structured = {"untrusted_data": data}
+            return CallToolResult(
+                content=[TextContent(type="text", text=json.dumps(structured, ensure_ascii=False)), *images],
+                structuredContent=structured,
+            )
         except AIKunError as exc:
             return CallToolResult(isError=True, content=[TextContent(type="text", text=exc.user_message())])
         except Exception as exc:
@@ -274,7 +372,21 @@ class DiscordMCP:
             return json.dumps(
                 {"error": " ".join(item.text for item in result.content if item.type == "text")}, ensure_ascii=False
             )
-        return json.dumps(result.structuredContent or {"untrusted_data": []}, ensure_ascii=False)
+        parts = []
+        for item in result.content[1:]:
+            if item.type == "text":
+                parts.append({"type": "text", "text": item.text})
+            elif item.type == "image":
+                parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{item.mimeType};base64,{item.data}",
+                            "detail": "low",
+                        },
+                    }
+                )
+        return ToolResult(json.dumps(result.structuredContent or {"untrusted_data": []}, ensure_ascii=False), parts)
 
 
 async def serve_stdio(settings: DiscordSettings):

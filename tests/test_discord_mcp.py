@@ -205,3 +205,162 @@ async def test_reply_chain_message_id_can_drive_mcp_get_message(settings, store,
     result = await service.generate_reply("返信先を詳しく確認して", channel_id=34567, discord_context=context)
     assert result.content == "返信先の発言も確認しました。"
     assert api.calls[-1][0] == "channels/34567/messages/50002"
+
+
+async def test_api_image_reaches_llm_as_multimodal_context(settings, store, monkeypatch):
+    import base64
+
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII="
+    )
+    api = FakeAPI(count=1)
+    original = api.message
+    api.message = lambda message_id: {
+        **original(message_id),
+        "attachments": [
+            {
+                "filename": "test.png",
+                "size": len(png),
+                "url": "https://cdn.discordapp.com/attachments/34567/50002/test.png",
+            }
+        ],
+    }
+    requests = []
+
+    def download(request):
+        requests.append(request)
+        assert "authorization" not in request.headers
+        return httpx.Response(200, content=png)
+
+    reader = DiscordReader(settings.discord, api=api, image_transport=httpx.MockTransport(download))
+    service = ChatService(settings, store)
+    service._tools.discord_mcp = DiscordMCP(settings.discord, reader=reader)
+    monkeypatch.setattr(store, "search", AsyncMock(return_value=()))
+    complete = AsyncMock(
+        side_effect=[
+            ModelTurn(tool_calls=(ToolCall("image-call", "discord_read_messages", '{"channel_id":"34567"}'),)),
+            ModelTurn(content="画像を読んだよ。"),
+        ]
+    )
+    monkeypatch.setattr(store, "complete_chat", complete)
+    await service.generate_reply("過去の画像を見て", channel_id=34567)
+    messages = complete.await_args.args[0]
+    assert messages[-2]["role"] == "tool"
+    assert '"image_status": "included"' in messages[-2]["content"]
+    assert messages[-1]["role"] == "user"
+    parts = messages[-1]["content"]
+    assert any(p["type"] == "text" and "50002" in p["text"] for p in parts)
+    image = next(p for p in parts if p["type"] == "image_url")
+    assert image["image_url"]["url"] == "data:image/png;base64," + base64.b64encode(png).decode()
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize(
+    "url,status,payload,size",
+    [
+        ("http://127.0.0.1/private", 200, b"bad", 3),
+        ("https://cdn.discordapp.com:invalid/attachments/a.png", 200, b"bad", 3),
+        ("https://cdn.discordapp.com/attachments/a.png", 403, b"bad", 3),
+        ("https://cdn.discordapp.com/attachments/a.png", 200, b"bad", 3),
+        ("https://cdn.discordapp.com/attachments/a.png", 200, b"bad", 9 * 1024 * 1024),
+        ("https://cdn.discordapp.com/attachments/a.png", 200, b"x" * (8 * 1024 * 1024 + 1), 0),
+    ],
+)
+async def test_image_failure_preserves_message_and_never_fetches_untrusted_hosts(settings, url, status, payload, size):
+    requests = []
+
+    def download(request):
+        requests.append(request)
+        return httpx.Response(status, content=payload)
+
+    data = {
+        "message": {
+            "id": "50001",
+            "content": "本文は残す",
+            "attachments": [
+                {"filename": "a.png", "url": url, "size": size},
+            ],
+        }
+    }
+    reader = DiscordReader(settings.discord, api=FakeAPI(), image_transport=httpx.MockTransport(download))
+    assert await reader.image_contents(data) == []
+    assert data["message"]["content"] == "本文は残す"
+    assert data["message"]["attachments"][0]["image_status"].startswith("unavailable:")
+    if url.startswith("http://127.") or ":invalid/" in url or size > 8 * 1024 * 1024:
+        assert requests == []
+
+
+async def test_channel_cache_expires_and_rechecks_guild(settings):
+    from tests.test_history import Clock
+
+    clock = Clock()
+    api = FakeAPI()
+    reader = DiscordReader(settings.discord, api=api, clock=clock)
+    for _ in range(10):
+        await reader.read("discord_read_messages", {"channel_id": "34567"})
+    assert len(api.calls) == 11  # 所属確認1回 + 本文10回。以前は20回。
+    clock.now = 61
+    api.guild_id = "99999"
+    from ai_kun.errors import InvalidInputError
+
+    with pytest.raises(InvalidInputError):
+        await reader.read("discord_read_messages", {"channel_id": "34567"})
+    assert len(api.calls) == 12  # キャッシュ期限後の所属確認で止まる。
+
+
+async def test_history_paging_wait_time_before_and_after(settings):
+    from tests.test_history import Clock
+
+    async def measure(legacy):
+        clock = Clock()
+
+        class LegacyLimiter(HalfRateLimiter):
+            def observe(self, route, major, headers):
+                super().observe(route, major, headers)
+                self.global_next = max(self.global_next, self.clock() + 2)
+
+        limiter = (LegacyLimiter if legacy else HalfRateLimiter)(clock, clock.sleep)
+
+        def handler(request):
+            return httpx.Response(200, json=[] if request.url.path.endswith("messages") else {"guild_id": "23456"})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            api = DiscordHistoryAPI("fake", http, limiter)
+            reader = DiscordReader(settings.discord, api=api, clock=clock)
+            for _ in range(10):
+                if legacy:
+                    reader._channels.clear()
+                await reader.read("discord_read_messages", {"channel_id": "34567"})
+        return clock.now
+
+    # ヘッダーなしの同一チャンネル10ページ。通信・LLM時間を含まない制御時計での再現。
+    assert await measure(False) == pytest.approx(18.04)
+    assert await measure(True) == pytest.approx(38)
+
+
+async def test_multiple_image_tools_keep_protocol_order_and_bound_context(settings, store, monkeypatch):
+    from ai_kun.tool_result import ToolResult
+
+    service = ChatService(settings, store)
+    monkeypatch.setattr(store, "search", AsyncMock(return_value=()))
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA", "detail": "low"}}
+    execute = AsyncMock(return_value=ToolResult('{"untrusted_data":[]}', [image] * 4))
+    monkeypatch.setattr(service._tools, "execute", execute)
+    complete = AsyncMock(
+        side_effect=[
+            ModelTurn(
+                tool_calls=tuple(
+                    ToolCall(f"call-{i}", "discord_read_messages", '{"channel_id":"34567"}') for i in range(3)
+                )
+            ),
+            ModelTurn(content="読めた範囲の画像について答える。"),
+        ]
+    )
+    monkeypatch.setattr(store, "complete_chat", complete)
+    await service.generate_reply("過去の画像を比較して", channel_id=34567)
+    messages = complete.await_args.args[0]
+    assert [m["role"] for m in messages[-5:]] == ["assistant", "tool", "tool", "tool", "user"]
+    parts = messages[-1]["content"]
+    assert sum(p["type"] == "image_url" for p in parts) == 8
+    assert any(p["type"] == "text" and "上限" in p["text"] for p in parts)
+    assert execute.await_count == 3  # 文脈の画像上限に達しても、残りの読み取りをキャンセルしない。

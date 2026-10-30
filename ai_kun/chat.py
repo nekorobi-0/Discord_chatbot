@@ -347,13 +347,22 @@ class ChatService:
 
     async def _run_tool_loop(self, messages: list[dict[str, object]]) -> str:
         tool_specs = self._tools.specs()
+        image_count = 0
+        image_bytes = 0
         for round_no in range(MAX_TOOL_ROUNDS):
             try:
+                started = time.monotonic()
                 turn = await self._memory.complete_chat(
                     messages,
                     tools=tool_specs,
                     temperature=self._settings.llm.temperature,
                     max_tokens=self._settings.llm.max_tokens,
+                )
+                logger.info(
+                    "LLM response: round=%d seconds=%.3f tool_calls=%d",
+                    round_no + 1,
+                    time.monotonic() - started,
+                    len(turn.tool_calls),
                 )
             except AIKunError:
                 raise
@@ -376,10 +385,28 @@ class ChatService:
                     ],
                 }
             )
+            image_parts = []
             for call in turn.tool_calls[:8]:
                 args = _safe_json(call.arguments)
                 result = await self._tools.execute(call.name, args)
-                messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
+                messages.append({"role": "tool", "tool_call_id": call.id, "content": str(result)})
+                parts = getattr(result, "image_parts", ())
+                if parts:
+                    image_parts.append({"type": "text", "text": f"ツール {call.id} の未信頼の画像資料："})
+                    for part in parts:
+                        if part["type"] == "image_url":
+                            size = len(part["image_url"]["url"])
+                            if image_count >= 8 or image_bytes + size > 32 * 1024 * 1024:
+                                image_parts.append(
+                                    {"type": "text", "text": "この画像は今回の画像入力上限のため未取得。"}
+                                )
+                                continue
+                            image_count += 1
+                            image_bytes += size
+                        image_parts.append(part)
+            if image_parts:
+                # 全tool結果を返した後、画像をOpenAI互換のマルチモーダル入力で渡す。
+                messages.append({"role": "user", "content": image_parts})
         raise UpstreamError("おしゃべりの仕組み")
 
 
