@@ -379,7 +379,10 @@ async def test_audio_attachment_still_uses_transcription(settings, store, monkey
     try:
         await client.on_message(message)
         transcribe.assert_awaited_once_with(b"audio bytes", "voice.ogg")
-        generate.assert_awaited_once_with("文字起こしです", channel_id=34567)
+        generate.assert_awaited_once()
+        assert generate.await_args.args == ("文字起こしです",)
+        assert generate.await_args.kwargs["channel_id"] == 34567
+        assert generate.await_args.kwargs["discord_context"].message_id == "9003"
         assert message.reply.await_args.args[0] == "音声の返答"
         message.channel.send.assert_not_awaited()
     finally:
@@ -589,6 +592,38 @@ async def test_unavailable_reply_target_is_ignored_without_ping_or_crash(setting
         await client.on_message(message)
         generate.assert_not_awaited()
         message.reply.assert_not_awaited()
+    finally:
+        await client.drain()
+        await client.close()
+
+
+async def test_bot_reply_passes_complete_chain_and_current_message_id_to_llm(settings, store, monkeypatch):
+    from tests.test_reply_chain import ancestor, reference
+
+    service = ChatService(settings, store)
+    monkeypatch.setattr(service, "ingest_message", AsyncMock())
+    monkeypatch.setattr(store, "search", AsyncMock(return_value=()))
+    complete = AsyncMock(return_value=ModelTurn(content="チェーン全体を踏まえた返答"))
+    monkeypatch.setattr(store, "complete_chat", complete)
+    client = AIKunClient(settings, service)
+    client._connection.user = SimpleNamespace(id=12345)
+    root = ancestor(60001, "最初の質問")
+    human = ancestor(60002, "追加の質問", parent=reference(60001, resolved=root))
+    bot = ancestor(60003, "前の回答", bot=True, parent=reference(60002, resolved=human))
+    message = file_message("その続きは？", [])
+    message.id = 90003
+    message.reference = reference(60003, resolved=bot)
+    try:
+        await client.on_message(message)
+        messages = complete.await_args.args[0]
+        assert "今回のDiscordメッセージID: 90003" in messages[0]["content"]
+        assert "今回の返信先メッセージID: 60003" in messages[0]["content"]
+        chain = next(item["content"] for item in messages if "今回の返信チェーン" in item["content"])
+        assert chain.index("最初の質問") < chain.index("追加の質問") < chain.index("前の回答")
+        for message_id in ("60001", "60002", "60003"):
+            assert message_id in chain
+        assert messages[-1]["content"] == "その続きは？"
+        assert message.reply.await_args.kwargs["mention_author"] is False
     finally:
         await client.drain()
         await client.close()

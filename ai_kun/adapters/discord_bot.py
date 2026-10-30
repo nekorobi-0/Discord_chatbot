@@ -9,12 +9,14 @@ from discord import app_commands
 
 from ..chat import ChatService, RetrievedItem
 from ..config import Settings
+from ..discord_context import DiscordContext
 from ..errors import AIKunError, InvalidInputError
 from ..images import IMAGE_EXTENSIONS, image_data_url
 from ..memory import DOCUMENT_EXTENSIONS, VOICE_EXTENSIONS
 from ..observability import metrics
 from ..text_files import FILE_TOKEN_LIMIT
 from ..work_queue import WorkQueue
+from .reply_chain import collect_reply_chain, resolve_reply
 
 logger = logging.getLogger(__name__)
 MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
@@ -204,28 +206,6 @@ class AIKunClient(discord.Client):
                 exc.user_message() if isinstance(exc, AIKunError) else "詳細非表示",
             )
 
-    async def _bot_reply_target(self, message):
-        reference = getattr(message, "reference", None)
-        if reference is None or self.user is None:
-            return None
-        if getattr(reference, "type", discord.MessageReferenceType.default) != discord.MessageReferenceType.default:
-            return None
-        if getattr(reference, "guild_id", message.guild.id) not in (None, message.guild.id):
-            return None
-        if getattr(reference, "channel_id", message.channel.id) not in (None, message.channel.id):
-            return None
-        target = getattr(reference, "resolved", None) or getattr(reference, "cached_message", None)
-        if isinstance(target, discord.DeletedReferencedMessage):
-            return None
-        if target is None and getattr(reference, "message_id", None) is not None:
-            try:
-                target = await message.channel.fetch_message(reference.message_id)
-            except discord.HTTPException as exc:
-                logger.warning("reply target fetch failed: status=%s code=%s", exc.status, exc.code)
-                return None
-        author = getattr(target, "author", None)
-        return target if author is not None and author.id == self.user.id else None
-
     async def _handle_message(self, message: discord.Message) -> None:
         if message.author.bot or not allowed(self.settings, message.guild.id if message.guild else None):
             return
@@ -245,14 +225,19 @@ class AIKunClient(discord.Client):
         self._schedule_backfill(message.channel.id)
 
         content = message.content.strip()
-        reply_target = await self._bot_reply_target(message)
+        reply_target, reply_stop = await resolve_reply(message, message.channel, message.guild.id)
+        is_bot_reply = (
+            reply_target is not None
+            and self.user is not None
+            and getattr(getattr(reply_target, "author", None), "id", None) == self.user.id
+        )
         prefixes = (f"<@{self.user.id}>", f"<@!{self.user.id}>") if self.user else ()
         if content == "!ai" or content.startswith("!ai "):
             content = content[3:].strip()
         elif content.startswith(prefixes):
             for prefix in prefixes:
                 content = content.removeprefix(prefix).strip()
-        elif reply_target is not None:
+        elif is_bot_reply:
             pass
         elif not any(
             attachment.filename.lower().endswith(tuple(DOCUMENT_EXTENSIONS | IMAGE_EXTENSIONS))
@@ -261,8 +246,9 @@ class AIKunClient(discord.Client):
             return
 
         async def operation():
+            context = await collect_reply_chain(message, reply_target, reply_stop)
             return await self._process_attachments(
-                content, message.attachments, message.channel.id, reply_target=reply_target
+                content, message.attachments, message.channel.id, discord_context=context
             )
 
         async with message.channel.typing():
@@ -270,16 +256,14 @@ class AIKunClient(discord.Client):
         for chunk in split_message(result):
             await message.reply(chunk, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
 
-    async def _process_attachments(self, content: str, attachments, channel_id: int, *, reply_target=None) -> str:
+    async def _process_attachments(
+        self, content: str, attachments, channel_id: int, *, discord_context: DiscordContext | None = None
+    ) -> str:
         text = content
         documents = []
-        if reply_target is not None:
-            documents.append(
-                RetrievedItem(
-                    label=f"今回の返信先Botメッセージ (message_id={reply_target.id})",
-                    text=str(reply_target.content or "")[:4000],
-                )
-            )
+        reply_kwargs = {"channel_id": channel_id}
+        if discord_context and (discord_context.message_id or discord_context.messages or discord_context.stop_reason):
+            reply_kwargs["discord_context"] = discord_context
         images = []
         notices = []
         prepared = []
@@ -344,8 +328,8 @@ class AIKunClient(discord.Client):
                     text, documents=documents, images=images, channel_id=channel_id
                 )
             elif documents:
-                answer = await self.service.generate_reply(text, documents=documents, channel_id=channel_id)
+                answer = await self.service.generate_reply(text, documents=documents, **reply_kwargs)
             else:
-                answer = await self.service.generate_reply(text, channel_id=channel_id)
+                answer = await self.service.generate_reply(text, **reply_kwargs)
             return "\n\n".join([answer.content, *notices])
         raise InvalidInputError("質問か、テキスト資料・画像・音声ファイルを送ってください。")

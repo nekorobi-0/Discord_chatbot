@@ -173,3 +173,35 @@ async def test_stdio_mcp_server_lists_tools_without_discord_network(settings):
             await session.initialize()
             tools = await session.list_tools()
             assert len(tools.tools) == 4
+
+
+async def test_reply_chain_message_id_can_drive_mcp_get_message(settings, store, monkeypatch):
+    from ai_kun.discord_context import DiscordContext
+
+    service = ChatService(settings, store)
+    api = FakeAPI()
+    service._tools.discord_mcp = client_for(settings, api)
+    monkeypatch.setattr(store, "search", AsyncMock(return_value=()))
+    context = DiscordContext(
+        message_id="90003",
+        reply_to_message_id="50002",
+        messages=({"message_id": "50002", "channel_id": "34567", "guild_id": "23456", "content": "前の発言"},),
+    )
+    calls = 0
+
+    async def complete(messages, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            assert "今回のDiscordメッセージID: 90003" in messages[0]["content"]
+            assert "今回の返信先メッセージID: 50002" in messages[0]["content"]
+            assert any('"message_id": "50002"' in message["content"] for message in messages)
+            return ModelTurn(
+                tool_calls=(ToolCall("reply-id", "discord_get_message", '{"channel_id":"34567","message_id":"50002"}'),)
+            )
+        return ModelTurn(content="返信先の発言も確認しました。")
+
+    monkeypatch.setattr(store, "complete_chat", complete)
+    result = await service.generate_reply("返信先を詳しく確認して", channel_id=34567, discord_context=context)
+    assert result.content == "返信先の発言も確認しました。"
+    assert api.calls[-1][0] == "channels/34567/messages/50002"

@@ -333,3 +333,23 @@ async def test_discord_source_footer_is_removed_when_user_declines_links(setting
     )
     result = await ChatService(settings, store).generate_reply("定例いつ？リンクはいらない")
     assert result.content == "定例は金曜日。"
+
+
+async def test_full_reply_context_is_not_truncated_by_rag_character_limit(settings, store, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from ai_kun.discord_context import DiscordContext
+
+    records = tuple(
+        {"message_id": str(60000 + index), "channel_id": "34567", "content": f"turn-{index}:" + "あ" * 3500}
+        for index in range(10)
+    )
+    context = DiscordContext(message_id="90003", reply_to_message_id="60009", messages=records)
+    complete = AsyncMock(return_value=ModelTurn(content="全体を確認しました"))
+    monkeypatch.setattr(store, "complete_chat", complete)
+    await ChatService(settings, store).generate_reply("この続き", channel_id=34567, discord_context=context)
+    messages = complete.await_args.args[0]
+    chain = next(item["content"] for item in messages if "今回の返信チェーン" in item["content"])
+    assert len(chain) > 24_000
+    assert "turn-0:" in chain and "turn-9:" in chain
+    assert "今回のDiscordメッセージID: 90003" in messages[0]["content"]

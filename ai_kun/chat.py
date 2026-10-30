@@ -16,6 +16,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from .config import Settings
+from .discord_context import DiscordContext
 from .errors import AIKunError, ConfigurationError, InvalidInputError, UpstreamError
 from .ingestion import stored_status
 from .memory import MemoryStore
@@ -223,9 +224,12 @@ class ChatService:
         documents: Sequence[RetrievedItem] = (),
         images: Sequence[str] = (),
         channel_id: int | None = None,
+        discord_context: DiscordContext | None = None,
     ) -> ChatResult:
         async with self._reply_lock:
-            return await self._generate_reply(content, documents=documents, images=images, channel_id=channel_id)
+            return await self._generate_reply(
+                content, documents=documents, images=images, channel_id=channel_id, discord_context=discord_context
+            )
 
     async def _generate_reply(
         self,
@@ -234,6 +238,7 @@ class ChatService:
         documents: Sequence[RetrievedItem] = (),
         images: Sequence[str] = (),
         channel_id: int | None = None,
+        discord_context: DiscordContext | None = None,
     ) -> ChatResult:
         """RAG を経由したうえで、1 往復の応答を返す。履歴は一切残さない。"""
         started = time.monotonic()
@@ -248,7 +253,9 @@ class ChatService:
         items = tuple(item for item in await self._retrieve(raw) if item.label.split(" ", 1)[0] not in attached)
         if items:
             metrics.increment("ai_kun.memory_retrievals_total")
-        messages = self._build_messages(raw, (*documents, *items), images=images, channel_id=channel_id)
+        messages = self._build_messages(
+            raw, (*documents, *items), images=images, channel_id=channel_id, discord_context=discord_context
+        )
 
         content_text = _without_unsolicited_discord_footer(await self._run_tool_loop(messages), raw)
         truncated = len(content_text) > self._settings.operational.max_output_chars
@@ -299,12 +306,21 @@ class ChatService:
         *,
         images: Sequence[str] = (),
         channel_id: int | None = None,
+        discord_context: DiscordContext | None = None,
     ) -> list[dict[str, object]]:
         prompt = SYSTEM_PROMPT
         prompt += f"\n設定済みDiscordサーバーID: {self._settings.discord.guild_id}"
         if channel_id is not None:
             prompt += f"\n今回のDiscordチャンネルID: {channel_id}。『このチャンネル』はこのIDを指す。"
-        if not items:
+        if discord_context is not None:
+            if discord_context.message_id:
+                prompt += f"\n今回のDiscordメッセージID: {discord_context.message_id}"
+            if discord_context.reply_to_message_id:
+                prompt += f"\n今回の返信先メッセージID: {discord_context.reply_to_message_id}"
+            prompt += "\nDiscord MCPには記録されたchannel_idとmessage_idを使い、IDを推測しない。"
+            if discord_context.stop_reason:
+                prompt += f"\n返信チェーンの取得は途中まで（理由: {discord_context.stop_reason}）。未取得部分を読んだと主張しない。"
+        if not items and not (discord_context and discord_context.messages):
             prompt += "\n今回参照できた保存記憶はありません。過去の話を覚えていると主張しないでください。"
         messages: list[dict[str, object]] = [{"role": "system", "content": prompt}]
         if items:
@@ -312,6 +328,15 @@ class ChatService:
             for item in items:
                 block.append(f"〔{item.label}〕\n{item.text}")
             messages.append({"role": "system", "content": "\n\n".join(block)[:24_000]})
+        if discord_context is not None and discord_context.messages:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": _UNTRUSTED_HEADER + "\n今回の返信チェーン（古い順。現在の発言は最後のuserメッセージ）。"
+                    "各発言のmessage_id・channel_idでDiscord MCPを呼び出せる。\n"
+                    + json.dumps(discord_context.messages, ensure_ascii=False),
+                }
+            )
         if images:
             parts = [{"type": "text", "text": user_text}]
             parts.extend({"type": "image_url", "image_url": {"url": image, "detail": "low"}} for image in images)
