@@ -1,4 +1,4 @@
-"""Discord履歴を100件ずつ取得。レート制限ヘッダーに追従する単独CLI用。"""
+"""Discord履歴を100件ずつ取得。稼働中のBotが自動バックフィルで使うレート制限ヘッダー追従のみを行う。"""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ import math
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
 
 import httpx
 from sqlmodel import Session
@@ -185,90 +184,35 @@ async def backfill_channel(settings, store, channel_id: int, *, api=None) -> dic
     """
     totals = {"scanned": 0, "imported": 0, "skipped": 0, "documents": 0}
     key = f"{settings.discord.guild_id}:{channel_id}"
-    with Session(get_engine()) as session:
-        checkpoint = session.get(HistoryCursorRecord, key)
-        cursor = int(checkpoint.last_message_id) if checkpoint else 0
-    async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
-        api = api or DiscordHistoryAPI(settings.discord.bot_token, client, shared_limiter)
-        channel = await api.get(channel_id)
-        if str(channel.get("guild_id")) != str(settings.discord.guild_id):
-            raise ConfigurationError("チャンネルのサーバーIDがGUILD_IDと一致しません。")
-        while True:
-            page = await api.get(channel_id, messages=True, after=cursor)
-            try:
-                ordered = sorted(page, key=lambda message: int(message["id"]))
-                eligible = [m for m in ordered if cursor < int(m["id"])]
-            except (KeyError, TypeError, ValueError):
-                raise UpstreamError("Discord履歴の形式") from None
-            if not eligible:
-                break
-            result = await store.ingest_history_page(settings.discord.guild_id, channel_id, eligible)
-            cursor = int(eligible[-1]["id"])
-            for name in totals:
-                totals[name] += result[name]
-            logger.info(
-                "auto backfill progress channel=%s scanned=%d imported=%d skipped=%d documents=%d",
-                channel_id,
-                totals["scanned"],
-                totals["imported"],
-                totals["skipped"],
-                totals["documents"],
-            )
-    return totals
-
-
-async def import_history(settings, store, *, api=None, until_id=None) -> dict[str, int]:
-    """全許可チャンネルを古い順に走査。ページの保存とカーソル更新は同じDBトランザクション。"""
-    if not settings.memory.enabled:
-        raise ConfigurationError("過去ログ取り込みには MEMORY_ENABLED=true が必要です。")
-    if until_id is None:
-        until_id = (int(datetime.now(UTC).timestamp() * 1000) - 1420070400000) << 22
-    totals = {"scanned": 0, "imported": 0, "skipped": 0, "documents": 0}
+    # 自動バックフィルも単独実行だけ。二重起動はカーソルを進めず、取り込みを重複させない。
     with importer_lock():
+        with Session(get_engine()) as session:
+            checkpoint = session.get(HistoryCursorRecord, key)
+            cursor = int(checkpoint.last_message_id) if checkpoint else 0
         async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
-            api = api or DiscordHistoryAPI(settings.discord.bot_token, client)
-            channels = await api.get(f"guilds/{settings.discord.guild_id}/channels")
-            entries = channels if isinstance(channels, list) else channels.get("data", [])
-            channel_ids = sorted(
-                int(entry["id"])
-                for entry in entries
-                if entry.get("type") in {0, 5} and str(entry.get("guild_id")) == str(settings.discord.guild_id)
-            )
-            if not channel_ids:
-                raise ConfigurationError(
-                    "GUILD_ID のサーバーでテキストチャンネルが見つからなかったよ。Botのチャンネル閲覧権限とサーバーIDを確認してほしいな。"
+            api = api or DiscordHistoryAPI(settings.discord.bot_token, client, shared_limiter)
+            channel = await api.get(channel_id)
+            if str(channel.get("guild_id")) != str(settings.discord.guild_id):
+                raise ConfigurationError("チャンネルのサーバーIDがGUILD_IDと一致しません。")
+            while True:
+                page = await api.get(channel_id, messages=True, after=cursor)
+                try:
+                    ordered = sorted(page, key=lambda message: int(message["id"]))
+                    eligible = [m for m in ordered if cursor < int(m["id"])]
+                except (KeyError, TypeError, ValueError):
+                    raise UpstreamError("Discord履歴の形式") from None
+                if not eligible:
+                    break
+                result = await store.ingest_history_page(settings.discord.guild_id, channel_id, eligible)
+                cursor = int(eligible[-1]["id"])
+                for name in totals:
+                    totals[name] += result[name]
+                logger.info(
+                    "auto backfill progress channel=%s scanned=%d imported=%d skipped=%d documents=%d",
+                    channel_id,
+                    totals["scanned"],
+                    totals["imported"],
+                    totals["skipped"],
+                    totals["documents"],
                 )
-            for channel_id in channel_ids:
-                channel = await api.get(channel_id)
-                if str(channel.get("guild_id")) != str(settings.discord.guild_id):
-                    raise ConfigurationError("チャンネルのサーバーIDがGUILD_IDと一致しません。")
-                if channel.get("type") not in {0, 5, 10, 11, 12}:
-                    raise ConfigurationError("履歴取り込みはテキストチャンネル・個別スレッドのみ対応しています。")
-                key = f"{settings.discord.guild_id}:{channel_id}"
-                with Session(get_engine()) as session:
-                    checkpoint = session.get(HistoryCursorRecord, key)
-                    cursor = int(checkpoint.last_message_id) if checkpoint else 0
-                while cursor < until_id:
-                    page = await api.get(channel_id, messages=True, after=cursor)
-                    try:
-                        page = sorted(page, key=lambda message: int(message["id"]))
-                        eligible = [m for m in page if cursor < int(m["id"]) <= until_id]
-                    except (KeyError, TypeError, ValueError):
-                        raise UpstreamError("Discord履歴の形式") from None
-                    if not eligible:
-                        break
-                    result = await store.ingest_history_page(settings.discord.guild_id, channel_id, eligible)
-                    cursor = int(eligible[-1]["id"])
-                    for name in totals:
-                        totals[name] += result[name]
-                    logger.info(
-                        "history progress channel=%s scanned=%d imported=%d skipped=%d documents=%d",
-                        channel_id,
-                        totals["scanned"],
-                        totals["imported"],
-                        totals["skipped"],
-                        totals["documents"],
-                    )
-                    if any(int(m["id"]) > until_id for m in page):
-                        break
     return totals

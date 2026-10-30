@@ -18,11 +18,7 @@ from .errors import ConfigurationError
 def main() -> None:
     parser = argparse.ArgumentParser(description="Discord RAG Bot: AIくん")
     parser.add_argument("--env-file", default=".env", help="読み込む設定ファイル（環境変数が優先）")
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument(
-        "--import-history", action="store_true", help="許可チャンネルの過去ログを取り込み終了（途中再開可）"
-    )
-    mode.add_argument("--check", action="store_true", help="設定・暗号鍵・DBを検証し、外部接続せず終了")
+    parser.add_argument("--check", action="store_true", help="設定とDBを検証し、外部接続せず終了")
     args = parser.parse_args()
     os.umask(0o077)
     load_dotenv(Path(args.env_file), override=False)
@@ -35,18 +31,10 @@ def main() -> None:
         print(f"設定エラー: {exc.user_message()}", file=sys.stderr)
         raise SystemExit(2) from None
     if args.check:
-        print("設定・暗号鍵・DB: OK（Discord / LLM / Embedding の疎通確認は行っていません）")
+        print("設定とDB: OK（Discord / LLM / Embedding の疎通確認は行っていません）")
         return
     try:
-        if args.import_history:
-            from .history import import_history
-
-            result = asyncio.run(import_history(settings, service._memory))
-            print(
-                f"履歴取り込み完了: 走査{result['scanned']}件、保存{result['imported']}件、除外{result['skipped']}件、文書{result['documents']}件"
-            )
-        else:
-            asyncio.run(run(settings, service))
+        asyncio.run(run(settings, service))
     except ConfigurationError as exc:
         print(f"取り込みエラー: {exc.user_message()}", file=sys.stderr)
         raise SystemExit(2) from None

@@ -75,7 +75,7 @@ def _sanitize_text(text: str) -> str:
 
 
 class MemoryStore:
-    """暗号化記憶の保存・検索・推論をまとめる唯一の窓口。"""
+    """記憶の保存・検索・推論をまとめる唯一の窓口。"""
 
     def __init__(
         self, embedding: EmbeddingSettings, llm: LLMSettings, asr: ASRSettings, memory: MemorySettings

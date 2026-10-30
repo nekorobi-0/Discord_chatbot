@@ -6,7 +6,7 @@ from sqlmodel import Session, select
 
 from ai_kun.db import HistoryCursorRecord, HistoryMessageRecord, MemoryDocumentRecord, get_engine
 from ai_kun.errors import ConfigurationError, UpstreamError
-from ai_kun.history import DiscordHistoryAPI, HalfRateLimiter, import_history, importer_lock
+from ai_kun.history import DiscordHistoryAPI, HalfRateLimiter, importer_lock
 
 
 class Clock:
@@ -267,14 +267,17 @@ class FakeAPI:
 
 
 async def test_paging_restart_and_snapshot(settings, embedded):
+    # 自動バックフィルは古い順に全件を取り込み、ページ境界でも中断・再開相当の
+    # 進行をカーソルへ記録する（手動CLI廃止後の経路で同じ保証を確認）。
+    from ai_kun.chat import ChatService
+
     api = FakeAPI()
-    first = await import_history(settings, embedded, api=api, until_id=150)
-    assert first["imported"] == 150
-    assert [after for _, messages, after in api.calls if messages] == [0, 100]
-    api.calls.clear()
-    second = await import_history(settings, embedded, api=api, until_id=300)
-    assert second["imported"] == 53
-    assert [after for _, messages, after in api.calls if messages] == [150, 203]
+    service = ChatService(settings, embedded)
+    first = await service.backfill_channel(34567, api=api)
+    assert first["imported"] == 203
+    # ページングは取得できた分を最後まで取り込んでからカーソルを進めるため、
+    # 末尾の不足ページぶんだけ追加の進行が発生する。要求どおり全203件が索引済み。
+    assert [after for _, messages, after in api.calls if messages] == [0, 100, 200, 203]
     with Session(get_engine()) as db:
         assert len(db.exec(select(HistoryMessageRecord)).all()) == 203
 
@@ -286,24 +289,45 @@ async def test_all_skipped_page_still_advances(settings, embedded):
                 return await super().get(channel_id)
             return [message(1, author={"bot": True})] if after == 0 else []
 
-    result = await import_history(settings, embedded, api=BotsOnly(), until_id=100)
+    from ai_kun.chat import ChatService
+
+    result = await ChatService(settings, embedded).backfill_channel(34567, api=BotsOnly())
     assert result["imported"] == 0 and result["scanned"] == 1 and result["skipped"] == 1
     with Session(get_engine()) as db:
         assert db.get(HistoryCursorRecord, "23456:34567").last_message_id == "1"
 
 
 async def test_wrong_guild_never_fetches_messages(settings, embedded):
+    from ai_kun.chat import ChatService
+
     api = FakeAPI(guild=99999)
     with pytest.raises(ConfigurationError, match="GUILD_ID"):
-        await import_history(settings, embedded, api=api)
-    # 一覧取得1回だけで、メッセージ取得へは進まない。
+        await ChatService(settings, embedded).backfill_channel(34567, api=api)
+    # チャンネル情報の取得1回だけで、メッセージ取得へは進まない。
     assert [messages for _, messages, _ in api.calls] == [False]
 
 
 async def test_memory_disabled_rejected(settings, embedded):
+    from ai_kun.chat import ChatService
+
     disabled = replace(settings, memory=replace(settings.memory, enabled=False))
-    with pytest.raises(ConfigurationError, match="MEMORY_ENABLED"):
-        await import_history(disabled, embedded, api=FakeAPI())
+    with pytest.raises(UpstreamError, match="記憶"):
+        await ChatService(disabled, embedded).backfill_channel(34567, api=FakeAPI())
+
+
+async def test_backfill_refuses_concurrent_run(settings, embedded):
+    # 自動バックフィルも単独実行。二重起動はカーソルを進めず取り込みを重複させない。
+    from ai_kun.chat import ChatService
+
+    api = FakeAPI()
+    with importer_lock():
+        with pytest.raises(ConfigurationError, match="実行中"):
+            await ChatService(settings, embedded).backfill_channel(34567, api=api)
+    assert api.calls == []
+    with Session(get_engine()) as db:
+        assert db.get(HistoryCursorRecord, "23456:34567") is None
+        assert db.exec(select(HistoryMessageRecord)).all() == []
+        assert db.exec(select(MemoryDocumentRecord)).all() == []
 
 
 def test_exclusive_importer_lock():

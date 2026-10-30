@@ -16,11 +16,6 @@ services:
   bot:
     <<: *runtime
     restart: unless-stopped
-  history-import:
-    <<: *runtime
-    profiles: [tools]
-    command: [python, -m, ai_kun, --import-history]
-    restart: "no"
 
 volumes:
   bot-data:
