@@ -130,17 +130,17 @@ async def test_ingest_failure_does_not_break_hook_reply(settings, store, monkeyp
         id="9002",
         author=SimpleNamespace(bot=False, id="111"),
         guild=SimpleNamespace(id=23456),
-        channel=SimpleNamespace(id=45678, typing=Typing, send=reply),
+        channel=SimpleNamespace(id=45678, typing=Typing, send=AsyncMock()),
         content="!ai こんにちは",
         webhook_id=None,
         created_at=datetime(2026, 10, 30, 12, 0, tzinfo=UTC),
         attachments=[],
-        reply=AsyncMock(),
+        reply=reply,
     )
     await client.on_message(message)
     # 取り込みは失敗しても、フックへの返信は通常どおり届く。
     reply.assert_awaited_once()
-    message.reply.assert_not_awaited()
+    message.channel.send.assert_not_awaited()
     assert "こんにちは" in reply.await_args.args[0]
     await client.close()
 
@@ -169,11 +169,11 @@ async def test_mention_and_prefix_reply(settings, store, monkeypatch):
             reply=AsyncMock(),
         )
         await client.on_message(message)
-        generate.assert_awaited_with("テスト")
-        message.channel.send.assert_awaited_once()
-        message.reply.assert_not_awaited()
-        assert message.channel.send.call_args.kwargs["allowed_mentions"].everyone is False
-        assert "reference" not in message.channel.send.call_args.kwargs
+        generate.assert_awaited_with("テスト", channel_id=34567)
+        message.reply.assert_awaited_once()
+        message.channel.send.assert_not_awaited()
+        assert message.reply.call_args.kwargs["allowed_mentions"].everyone is False
+        assert message.reply.call_args.kwargs["mention_author"] is False
     await client.close()
 
 
@@ -297,22 +297,20 @@ async def test_text_attachment_uses_document_ingestion_without_asr(settings, sto
         await client.on_message(message)
         transcribe.assert_not_awaited()
         attachment.read.assert_awaited_once()
-        message.reply.assert_not_awaited()
-        message.channel.send.assert_awaited()
-        sent = "".join(call.args[0] for call in message.channel.send.await_args_list)
-        assert "資料.TXT を登録しました" in sent
+        message.channel.send.assert_not_awaited()
+        message.reply.assert_awaited()
+        sent = "".join(call.args[0] for call in message.reply.await_args_list)
+        assert "登録しました" not in sent
+        assert "RAG" not in sent
         with Session(get_engine()) as session:
             documents = session.exec(select(MemoryDocumentRecord).where(MemoryDocumentRecord.source == "upload")).all()
             assert len(documents) == 1
             assert "納期は金曜日" in documents[0].content
-        if "要約" in content:
-            complete.assert_awaited_once()
-            messages = complete.await_args.args[0]
-            assert any("納期は金曜日" in m["content"] and m["role"] == "system" for m in messages)
-            assert sum(m["content"].count("納期は金曜日") for m in messages) == 1
-            assert "資料の要約です" in sent
-        else:
-            complete.assert_not_awaited()
+        complete.assert_awaited_once()
+        messages = complete.await_args.args[0]
+        assert any("納期は金曜日" in m["content"] and m["role"] == "system" for m in messages)
+        assert sum(m["content"].count("納期は金曜日") for m in messages) == 1
+        assert "資料の要約です" in sent
         status = await service.ingestion_status()
         assert status["stored"]["documents"] >= 1
         assert any(job["kind"] == "document" for job in status["recent"])
@@ -342,7 +340,7 @@ async def test_multiple_files_share_4096_token_budget(settings, store, monkeypat
             documents = session.exec(select(MemoryDocumentRecord).where(MemoryDocumentRecord.source == "upload")).all()
             assert len(documents) == 2
             assert sum(len(file_encoding().encode(doc.content)) for doc in documents) <= FILE_TOKEN_LIMIT
-        sent = "".join(call.args[0] for call in message.channel.send.await_args_list)
+        sent = "".join(call.args[0] for call in message.reply.await_args_list)
         assert "先頭部分のみ" in sent
         assert "4,096" in sent
         assert "確認しました" in sent
@@ -361,7 +359,7 @@ async def test_unsupported_attachment_is_not_sent_to_asr(settings, store, monkey
     message = file_message("!ai 見て", [attachment])
     try:
         await client.on_message(message)
-        assert "対応していません" in message.channel.send.await_args.args[0]
+        assert "対応していません" in message.reply.await_args.args[0]
         transcribe.assert_not_awaited()
         attachment.read.assert_not_awaited()
     finally:
@@ -381,9 +379,9 @@ async def test_audio_attachment_still_uses_transcription(settings, store, monkey
     try:
         await client.on_message(message)
         transcribe.assert_awaited_once_with(b"audio bytes", "voice.ogg")
-        generate.assert_awaited_once_with("文字起こしです")
-        assert message.channel.send.await_args.args[0] == "音声の返答"
-        message.reply.assert_not_awaited()
+        generate.assert_awaited_once_with("文字起こしです", channel_id=34567)
+        assert message.reply.await_args.args[0] == "音声の返答"
+        message.channel.send.assert_not_awaited()
     finally:
         await client.close()
 
@@ -406,7 +404,7 @@ async def test_text_attachment_can_be_read_without_rag_or_asr(settings, store, m
         ingest.assert_not_awaited()
         transcribe.assert_not_awaited()
         assert any("議題は次のリリース日" in m["content"] for m in complete.await_args.args[0])
-        assert "本文を読みました" in "".join(call.args[0] for call in message.channel.send.await_args_list)
+        assert "本文を読みました" in "".join(call.args[0] for call in message.reply.await_args_list)
     finally:
         await client.drain()
         await client.close()
@@ -422,7 +420,7 @@ async def test_oversized_file_is_rejected_before_download_or_asr(settings, store
     message = file_message("", [attachment])
     try:
         await client.on_message(message)
-        assert "8 MiB" in message.channel.send.await_args.args[0]
+        assert "8 MiB" in message.reply.await_args.args[0]
         attachment.read.assert_not_awaited()
         transcribe.assert_not_awaited()
     finally:
@@ -455,8 +453,8 @@ async def test_image_attachment_reaches_multimodal_llm_without_asr(settings, sto
         url = parts[1]["image_url"]["url"]
         assert url.startswith("data:image/png;base64,")
         assert base64.b64decode(url.split(",", 1)[1]) == image
-        assert message.channel.send.await_args.args[0] == "画像を確認しました"
-        message.reply.assert_not_awaited()
+        assert message.reply.await_args.args[0] == "画像を確認しました"
+        message.channel.send.assert_not_awaited()
     finally:
         await client.drain()
         await client.close()
@@ -482,8 +480,115 @@ async def test_reply_does_not_wait_for_background_backfill(settings, store, monk
         await asyncio.wait_for(client.on_message(message), timeout=1)
         await entered.wait()
         assert not release.is_set()
-        message.channel.send.assert_awaited_once()
+        message.reply.assert_awaited_once()
     finally:
         release.set()
+        await client.drain()
+        await client.close()
+
+
+@pytest.mark.parametrize("cached", [True, False])
+async def test_reply_to_own_bot_message_triggers_without_mention_and_includes_context(
+    settings, store, monkeypatch, cached
+):
+    import discord
+
+    service = ChatService(settings, store)
+    monkeypatch.setattr(service, "ingest_message", AsyncMock())
+    complete = AsyncMock(return_value=ModelTurn(content="定例は15時からだよ。"))
+    monkeypatch.setattr(store, "complete_chat", complete)
+    monkeypatch.setattr(store, "search", AsyncMock(return_value=()))
+    client = AIKunClient(settings, service)
+    client._connection.user = SimpleNamespace(id=12345)
+    target = SimpleNamespace(id=60001, author=SimpleNamespace(id=12345, bot=True), content="次回の定例は金曜日です。")
+    message = file_message("何時から？", [])
+    message.mentions = []
+    message.reference = SimpleNamespace(
+        message_id=60001,
+        channel_id=34567,
+        guild_id=23456,
+        type=discord.MessageReferenceType.default,
+        resolved=target if cached else None,
+    )
+    message.channel.fetch_message = AsyncMock(return_value=target)
+    try:
+        await client.on_message(message)
+        complete.assert_awaited_once()
+        messages = complete.await_args.args[0]
+        assert messages[-1]["content"] == "何時から？"
+        assert any("次回の定例は金曜日です。" in m["content"] for m in messages)
+        assert message.reply.await_args.args[0] == "定例は15時からだよ。"
+        assert message.reply.await_args.kwargs["mention_author"] is False
+        message.channel.send.assert_not_awaited()
+        if cached:
+            message.channel.fetch_message.assert_not_awaited()
+        else:
+            message.channel.fetch_message.assert_awaited_once_with(60001)
+    finally:
+        await client.drain()
+        await client.close()
+
+
+@pytest.mark.parametrize(
+    "author_id,guild,type_name",
+    [
+        (99999, 23456, "default"),
+        (12345, 99999, "default"),
+        (12345, 23456, "forward"),
+    ],
+)
+async def test_reply_to_others_other_guild_or_forward_does_not_trigger(
+    settings, store, monkeypatch, author_id, guild, type_name
+):
+    import discord
+
+    service = ChatService(settings, store)
+    monkeypatch.setattr(service, "ingest_message", AsyncMock())
+    generate = AsyncMock()
+    monkeypatch.setattr(service, "generate_reply", generate)
+    client = AIKunClient(settings, service)
+    client._connection.user = SimpleNamespace(id=12345)
+    message = file_message("普通の返信", [])
+    message.reference = SimpleNamespace(
+        message_id=60001,
+        channel_id=34567,
+        guild_id=guild,
+        type=getattr(discord.MessageReferenceType, type_name),
+        resolved=SimpleNamespace(author=SimpleNamespace(id=author_id), content="previous"),
+    )
+    message.channel.fetch_message = AsyncMock()
+    try:
+        await client.on_message(message)
+        generate.assert_not_awaited()
+        message.reply.assert_not_awaited()
+        message.channel.fetch_message.assert_not_awaited()
+    finally:
+        await client.drain()
+        await client.close()
+
+
+async def test_unavailable_reply_target_is_ignored_without_ping_or_crash(settings, store, monkeypatch):
+    import discord
+
+    service = ChatService(settings, store)
+    monkeypatch.setattr(service, "ingest_message", AsyncMock())
+    generate = AsyncMock()
+    monkeypatch.setattr(service, "generate_reply", generate)
+    client = AIKunClient(settings, service)
+    client._connection.user = SimpleNamespace(id=12345)
+    message = file_message("普通の返信", [])
+    message.reference = SimpleNamespace(
+        message_id=60001, channel_id=34567, guild_id=23456, type=discord.MessageReferenceType.default, resolved=None
+    )
+    message.channel.fetch_message = AsyncMock(
+        side_effect=discord.Forbidden(
+            SimpleNamespace(status=403, reason="Forbidden"), {"message": "Missing Access", "code": 50001}
+        )
+    )
+    try:
+        await client.on_message(message)
+        generate.assert_not_awaited()
+        message.reply.assert_not_awaited()
+    finally:
         await client.drain()
         await client.close()

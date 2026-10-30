@@ -122,7 +122,7 @@ class AIKunClient(discord.Client):
         @app_commands.describe(question="質問内容")
         async def ask(interaction: discord.Interaction, question: str):
             async def operation():
-                return (await self.service.generate_reply(question)).content
+                return (await self.service.generate_reply(question, channel_id=interaction.channel_id)).content
 
             await self._answer(interaction, operation)
 
@@ -204,6 +204,28 @@ class AIKunClient(discord.Client):
                 exc.user_message() if isinstance(exc, AIKunError) else "詳細非表示",
             )
 
+    async def _bot_reply_target(self, message):
+        reference = getattr(message, "reference", None)
+        if reference is None or self.user is None:
+            return None
+        if getattr(reference, "type", discord.MessageReferenceType.default) != discord.MessageReferenceType.default:
+            return None
+        if getattr(reference, "guild_id", message.guild.id) not in (None, message.guild.id):
+            return None
+        if getattr(reference, "channel_id", message.channel.id) not in (None, message.channel.id):
+            return None
+        target = getattr(reference, "resolved", None) or getattr(reference, "cached_message", None)
+        if isinstance(target, discord.DeletedReferencedMessage):
+            return None
+        if target is None and getattr(reference, "message_id", None) is not None:
+            try:
+                target = await message.channel.fetch_message(reference.message_id)
+            except discord.HTTPException as exc:
+                logger.warning("reply target fetch failed: status=%s code=%s", exc.status, exc.code)
+                return None
+        author = getattr(target, "author", None)
+        return target if author is not None and author.id == self.user.id else None
+
     async def _handle_message(self, message: discord.Message) -> None:
         if message.author.bot or not allowed(self.settings, message.guild.id if message.guild else None):
             return
@@ -223,12 +245,15 @@ class AIKunClient(discord.Client):
         self._schedule_backfill(message.channel.id)
 
         content = message.content.strip()
+        reply_target = await self._bot_reply_target(message)
         prefixes = (f"<@{self.user.id}>", f"<@!{self.user.id}>") if self.user else ()
         if content == "!ai" or content.startswith("!ai "):
             content = content[3:].strip()
         elif content.startswith(prefixes):
             for prefix in prefixes:
                 content = content.removeprefix(prefix).strip()
+        elif reply_target is not None:
+            pass
         elif not any(
             attachment.filename.lower().endswith(tuple(DOCUMENT_EXTENSIONS | IMAGE_EXTENSIONS))
             for attachment in message.attachments
@@ -236,18 +261,27 @@ class AIKunClient(discord.Client):
             return
 
         async def operation():
-            return await self._process_attachments(content, message.attachments, message.channel.id)
+            return await self._process_attachments(
+                content, message.attachments, message.channel.id, reply_target=reply_target
+            )
 
         async with message.channel.typing():
             result = await self._run(operation)
         for chunk in split_message(result):
-            await message.channel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+            await message.reply(chunk, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
 
-    async def _process_attachments(self, content: str, attachments, channel_id: int) -> str:
+    async def _process_attachments(self, content: str, attachments, channel_id: int, *, reply_target=None) -> str:
         text = content
         documents = []
+        if reply_target is not None:
+            documents.append(
+                RetrievedItem(
+                    label=f"今回の返信先Botメッセージ (message_id={reply_target.id})",
+                    text=str(reply_target.content or "")[:4000],
+                )
+            )
         images = []
-        receipts = []
+        notices = []
         prepared = []
         audio_count = 0
         tokens_remaining = FILE_TOKEN_LIMIT
@@ -296,22 +330,22 @@ class AIKunClient(discord.Client):
                         attachment.filename, document.text.encode("utf-8"), channel_id=channel_id
                     )
                     label = f"document:{result['document_id']} ({attachment.filename})"
-                    receipts.append(f"{attachment.filename} を登録しました（{result['chunks']}チャンク）。")
-                else:
-                    receipts.append(f"{attachment.filename} を読み込みました。")
                 if document.truncated:
-                    receipts.append(f"{attachment.filename}: 先頭部分のみ読み込みました（添付合計4,096トークン上限）。")
+                    notices.append(f"{attachment.filename}: 先頭部分のみ参照しました（添付合計4,096トークン上限）。")
                 documents.append(RetrievedItem(label=label, text=document.text))
-        if images and not text.strip():
-            text = "添付画像の内容を説明してください。"
+        if not text.strip():
+            if images:
+                text = "添付画像の内容を説明してください。"
+            elif documents:
+                text = "添付資料の要点を短くまとめてください。"
         if text.strip():
             if images:
-                answer = await self.service.generate_reply(text, documents=documents, images=images)
+                answer = await self.service.generate_reply(
+                    text, documents=documents, images=images, channel_id=channel_id
+                )
             elif documents:
-                answer = await self.service.generate_reply(text, documents=documents)
+                answer = await self.service.generate_reply(text, documents=documents, channel_id=channel_id)
             else:
-                answer = await self.service.generate_reply(text)
-            receipts.append(answer.content)
-        if not receipts:
-            raise InvalidInputError("質問か、テキスト資料・画像・音声ファイルを送ってください。")
-        return "\n\n".join(receipts)
+                answer = await self.service.generate_reply(text, channel_id=channel_id)
+            return "\n\n".join([answer.content, *notices])
+        raise InvalidInputError("質問か、テキスト資料・画像・音声ファイルを送ってください。")

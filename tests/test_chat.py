@@ -292,3 +292,44 @@ async def test_backfill_burst_shares_scan_but_completes_every_request(settings, 
     status = await service.ingestion_status()
     assert len(status["recent"]) == 100
     assert all(job["status"] == "completed" and job["result"]["shared_requests"] == 100 for job in status["recent"])
+
+
+@pytest.mark.parametrize("header", ["根拠データ：", "**根拠データ：**", "**根拠データ**：", "参照メッセージ:"])
+async def test_unsolicited_discord_source_footer_is_removed(settings, store, monkeypatch, header):
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(
+        store,
+        "complete_chat",
+        AsyncMock(
+            return_value=ModelTurn(
+                content=f"定例は金曜日だよ。\n\n{header}\n[#雑談](https://discord.com/channels/23456/34567/60001)"
+            )
+        ),
+    )
+    assert (await ChatService(settings, store).generate_reply("定例はいつ？")).content == "定例は金曜日だよ。"
+
+
+async def test_discord_source_link_is_kept_when_explicitly_requested(settings, store, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    response = "元の発言: https://discord.com/channels/23456/34567/60001"
+    monkeypatch.setattr(store, "complete_chat", AsyncMock(return_value=ModelTurn(content=response)))
+    result = await ChatService(settings, store).generate_reply("元の発言のリンクを出して")
+    assert result.content == response
+
+
+async def test_discord_source_footer_is_removed_when_user_declines_links(settings, store, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(
+        store,
+        "complete_chat",
+        AsyncMock(
+            return_value=ModelTurn(
+                content="定例は金曜日。\n\n根拠データ：\nhttps://discord.com/channels/23456/34567/60001"
+            )
+        ),
+    )
+    result = await ChatService(settings, store).generate_reply("定例いつ？リンクはいらない")
+    assert result.content == "定例は金曜日。"

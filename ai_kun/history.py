@@ -122,7 +122,7 @@ class DiscordHistoryAPI:
         self.token = token
         self.limiter = limiter or HalfRateLimiter()
 
-    async def get(self, resource, *, messages=False, after=0):
+    async def get(self, resource, *, messages=False, after=None, before=None, limit=100, expect_list=False):
         """チャンネルIDまたはDiscord APIパス（例: guilds/<id>/channels）へのGET。"""
         route = "messages" if messages else "resource"
         channel_id = resource
@@ -131,13 +131,20 @@ class DiscordHistoryAPI:
             if messages
             else (f"/channels/{channel_id}" if str(resource).isdigit() else f"/{resource}")
         )
+        params = None
+        if messages:
+            params = {"limit": limit}
+            if after is not None:
+                params["after"] = str(after)
+            if before is not None:
+                params["before"] = str(before)
         major = str(channel_id)
         for attempt in range(5):
             await self.limiter.wait(route, major)
             try:
                 response = await self.client.get(
                     API + path,
-                    params={"limit": 100, "after": str(after)} if messages else None,
+                    params=params,
                     headers={"Authorization": f"Bot {self.token}", "User-Agent": "AIKunHistory/0.1.0"},
                 )
             except httpx.TransportError:
@@ -169,7 +176,9 @@ class DiscordHistoryAPI:
                 data = response.json()
             except ValueError:
                 raise UpstreamError("Discord履歴取得") from None
-            if (messages and not isinstance(data, list)) or (not messages and not isinstance(data, dict)):
+            if ((messages or expect_list) and not isinstance(data, list)) or (
+                not (messages or expect_list) and not isinstance(data, dict)
+            ):
                 raise UpstreamError("Discord履歴取得")
             return data
         raise UpstreamError("Discord履歴取得（再試行上限）")

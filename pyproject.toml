@@ -15,6 +15,7 @@ dependencies = [
   "python-dotenv>=1.1,<2",
   "aiohttp>=3.12,<4",
   "tiktoken>=0.12,<1",
+  "mcp>=1.20,<2",
 ]
 
 [project.optional-dependencies]
