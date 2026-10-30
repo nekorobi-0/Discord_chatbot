@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 from .config import Settings, mask_pii
 from .errors import AIKunError, ConfigurationError, InvalidInputError, UpstreamError
+from .ingestion import stored_status
 from .memory import MemoryStore
 from .observability import AuditLog, metrics
 from .tools import ToolHub
@@ -131,7 +132,28 @@ class ChatService:
             raise UpstreamError("記憶")
         from .history import backfill_channel as _backfill
 
-        return await _backfill(self._settings, self._memory, int(channel_id), api=api)
+        job = self._memory.ingestion.start(self._settings.discord.guild_id, channel_id, "backfill")
+        try:
+            result = await _backfill(self._settings, self._memory, int(channel_id), api=api)
+        except BaseException as exc:
+            self._memory.ingestion.finish(job, error=type(exc).__name__)
+            raise
+        self._memory.ingestion.finish(job, result=result)
+        return result
+
+    async def ingestion_status(self) -> dict:
+        settings = self._settings
+        stored = await asyncio.to_thread(
+            stored_status, settings.discord.guild_id, settings.embedding.model, settings.embedding.dimension
+        )
+        return {
+            "enabled": settings.memory.enabled,
+            "guild_id": str(settings.discord.guild_id),
+            "model": settings.embedding.model,
+            "dimension": settings.embedding.dimension,
+            "stored": stored,
+            **self._memory.ingestion.snapshot(settings.discord.guild_id),
+        }
 
     async def delete_memory(self, document_id: str) -> int:
         """文書単位で記憶から削除（忘れられる権利対応）。"""

@@ -37,6 +37,7 @@ from .db import (
     init_db,
 )
 from .errors import InvalidInputError, RateLimitError, UpstreamError
+from .ingestion import IngestionMonitor
 
 logger = logging.getLogger("ai_kun.memory")
 
@@ -99,12 +100,11 @@ class MemoryStore:
         self._llm = llm
         self._asr = asr
         self._memory = memory
+        self.ingestion = IngestionMonitor()
         init_db()
 
     # ---------- HTTP（SSRF 対策つき）----------
-    # 平文 HTTP を認めるのはループバックだけ。承認範囲を広げると、この環境のように名前解決が無い
-    # host では `http://100.64.0.1` のような公開中継インフラ（CGNAT）やリンクローカルへの平文要求が
-    # 検査を素通りして接続確立まで行われてしまう。HTTPS は従来どおり検証せず透過する。
+    # 平文HTTPの送信先は、設定時と同じループバック・RFC1918の範囲で検証する。
     @staticmethod
     def _is_internal_ip(literal: str) -> bool:
         """設定検証と同じ宛先ポリシーで判定する。"""
@@ -345,6 +345,16 @@ class MemoryStore:
         return {"chunks": len(chunks), "document_id": document_id}
 
     async def ingest_history_page(self, guild_id: int, channel_id: int, messages: list[dict]) -> dict[str, int]:
+        job = self.ingestion.start(guild_id, channel_id, "messages", len(messages))
+        try:
+            result = await self._ingest_history_page(guild_id, channel_id, messages)
+        except BaseException as exc:
+            self.ingestion.finish(job, error=type(exc).__name__)
+            raise
+        self.ingestion.finish(job, result=result)
+        return result
+
+    async def _ingest_history_page(self, guild_id: int, channel_id: int, messages: list[dict]) -> dict[str, int]:
         """20発言・30分・文字数を目安にまとめる。ページ保存と進捗は原子的に更新。"""
         if not self._memory.enabled:
             raise UpstreamError("記憶")

@@ -172,7 +172,7 @@ async def test_http_dashboard_and_metrics_without_auth(settings):
         for path in ("/", "/dashboard"):
             response = await client.get(path)
             assert response.status == 200
-            assert "AIくん 運用情報" in await response.text()
+            assert "Discord → RAG 取り込み状況" in await response.text()
         response = await client.get("/metrics/v1")
         assert response.status == 200
         assert set(await response.json()) == {"counters"}
