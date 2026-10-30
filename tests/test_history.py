@@ -186,8 +186,9 @@ async def test_group_mask_deduplicate_and_citations(embedded):
         message(5, ""),
         message(6, "system", type=6),
     ]
+    # 人間全員の発言は問答無用で取り込む。Bot・システム通知・空本文だけが除外。
     result = await embedded.ingest_history_page(23456, 34567, messages)
-    assert result == {"scanned": 6, "imported": 2, "skipped": 4, "documents": 1}
+    assert result == {"scanned": 6, "imported": 3, "skipped": 3, "documents": 1}
     with Session(get_engine()) as db:
         cursor = db.get(HistoryCursorRecord, "23456:34567")
         assert cursor.last_message_id == "6"
@@ -195,7 +196,7 @@ async def test_group_mask_deduplicate_and_citations(embedded):
         doc = db.exec(select(MemoryDocumentRecord)).one()
         assert "alice@" not in doc.content and "[EMAIL]" in doc.content
         assert "2026-10-30" in doc.content and "member-" in doc.content
-        assert "覚えないで" not in doc.content
+        assert "覚えないで" in doc.content  # オプトアウト廃止：マーカーごと記録・索引される
         document_id = doc.document_id
     hits = await embedded.search("締切")
     assert "https://discord.com/channels/23456/34567/" in hits[0].label

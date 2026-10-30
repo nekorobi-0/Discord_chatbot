@@ -3,7 +3,7 @@ from dataclasses import replace
 import httpx
 import pytest
 
-from ai_kun.chat import ChatService, _is_memory_opt_out
+from ai_kun.chat import ChatService
 from ai_kun.errors import InvalidInputError, RateLimitError, UpstreamError
 from ai_kun.memory import ModelTurn, ToolCall
 
@@ -102,21 +102,23 @@ async def test_invalid_input(settings, store, content):
         await ChatService(settings, store).generate_reply(content)
 
 
-@pytest.mark.parametrize("content", ["覚えないで", "memory off", "do not learn", "学習しないで"])
-async def test_opt_out(settings, store, monkeypatch, content):
-    assert _is_memory_opt_out(content)
-    with pytest.raises(InvalidInputError):
-        await ChatService(settings, store).remember(content)
+async def test_opt_out_phrases_no_longer_skip(settings, store, monkeypatch):
+    # オプトアウト廃止：旧マーカー入りの内容も普通に保存・検索される。
+    async def embed(texts):
+        return [[1.0] + [0.0] * 63 for text in texts]
 
-    async def search(*args, **kwargs):
-        pytest.fail("opt out must skip retrieval")
+    monkeypatch.setattr(store, "embed", embed)
+    result = await ChatService(settings, store).remember("覚えないで sayaka@example.com の締切は金曜日")
+    hits = await store.search("締切")
+    assert result["chunks"] >= 1
+    assert hits and "金曜日" in hits[0].text
 
     async def complete(*args, **kwargs):
-        return ModelTurn(content="保存しません。")
+        return ModelTurn(content="こんにちは！")
 
-    monkeypatch.setattr(store, "search", search)
     monkeypatch.setattr(store, "complete_chat", complete)
-    await ChatService(settings, store).generate_reply(content + " 資料")
+    reply = await ChatService(settings, store).generate_reply("覚えないで プロジェクトの締切は？")
+    assert reply.content
 
 
 async def test_tool_loop_is_bounded(settings, store, monkeypatch):

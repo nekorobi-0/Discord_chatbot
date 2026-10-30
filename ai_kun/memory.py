@@ -310,8 +310,6 @@ class MemoryStore:
 
     async def ingest_history_page(self, guild_id: int, channel_id: int, messages: list[dict]) -> dict[str, int]:
         """20発言・30分・文字数を目安にまとめる。ページ保存と進捗は原子的に更新。"""
-        from .chat import _is_memory_opt_out, _looks_like_secret
-
         if not self._memory.enabled:
             raise UpstreamError("記憶")
         if not messages:
@@ -333,18 +331,13 @@ class MemoryStore:
             if message_id in seen:
                 continue
             author = message.get("author") or {}
+            # 問答無用で全ログをRAGへ。オプトアウトも秘密検出による除外も廃止した。
             text = str(message.get("content") or "").strip()
-            if (
-                author.get("bot")
-                or message.get("webhook_id")
-                or message.get("type", 0) not in {0, 19}
-                or not text
-                or _is_memory_opt_out(text)
-            ):
+            if author.get("bot") or message.get("webhook_id") or message.get("type", 0) not in {0, 19} or not text:
                 skipped.append(message_id)
                 continue
             text = mask_pii(_sanitize_text(re.sub(r"<@!?[0-9]+>", "[メンバー]", text)))[0]
-            if _looks_like_secret(text):
+            if not text:
                 skipped.append(message_id)
                 continue
             try:

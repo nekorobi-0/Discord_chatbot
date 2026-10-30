@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import math
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -97,8 +96,6 @@ class ChatService:
         return await self._memory.ingest_document(name, data)
 
     async def remember(self, content: str) -> dict[str, int | str]:
-        if _is_memory_opt_out(content):
-            raise InvalidInputError("記憶しないで、という指定があるため保存しませんでした。")
         return await self.ingest_document("memory.txt", content.encode("utf-8"))
 
     async def delete_memory(self, document_id: str) -> int:
@@ -128,24 +125,13 @@ class ChatService:
             raise InvalidInputError("ちょっと長すぎちゃった。分割してもう一回おねがい。")
 
         masked, pii_count = mask_pii(raw)
-        if _looks_like_secret(masked):
-            metrics.increment("ai_kun.secret_in_input_detected_total")
-            return ChatResult(
-                content="それ、たぶん秘密の鍵っぽいから、そのまま読まないでおいたよ。中身の話はもう一回ひみつの場所でやってね。",
-                pii_masked_count=max(pii_count, 1),
-                degraded=True,
-            )
-
         if not masked.strip():
             raise InvalidInputError("読めたのが伏せ字だけだったよ。もう少し続けてくれる？")
 
-        items: tuple[RetrievedItem, ...] = ()
-        if _is_memory_opt_out(masked):
-            metrics.increment("ai_kun.memory_skipped_total")
-        elif _needs_memory_lookup(masked):
-            items = await self._retrieve(masked)
-            if items:
-                metrics.increment("ai_kun.memory_retrievals_total")
+        # 質問はすべて記憶検索を対象にする（オプトアウト廃止）。
+        items = await self._retrieve(masked)
+        if items:
+            metrics.increment("ai_kun.memory_retrievals_total")
         messages = self._build_messages(masked, items)
 
         content_text = await self._run_tool_loop(messages)
@@ -252,49 +238,6 @@ def _safe_json(raw: str) -> Mapping[str, object]:
     except (ValueError, TypeError):
         return {}
     return parsed if isinstance(parsed, Mapping) else {}
-
-
-def _needs_memory_lookup(text: str) -> bool:
-    """保存記憶がある場合は質問ごとに参照。明示的な拒否は優先する。"""
-    return bool(text.strip()) and not _is_memory_opt_out(text)
-
-
-def _is_memory_opt_out(text: str) -> bool:
-    lowered = text.lower()
-    return any(
-        marker in lowered
-        for marker in (
-            "おぼえないで",
-            "覚えないで",
-            "記憶しないで",
-            "きおくしないで",
-            "学習しないで",
-            "memory off",
-            "don't learn",
-            "do not learn",
-        )
-    )
-
-
-def _looks_like_secret(text: str) -> bool:
-    """伏せたあとも残る『鍵らしさ』の最終チェック。16 進/ランダム塊など。"""
-    candidates = [chunk for chunk in text.split() if len(chunk) >= 24]
-    for chunk in candidates:
-        alnum = sum(ch.isalnum() for ch in chunk)
-        digits = sum(ch.isdigit() for ch in chunk)
-        letters = sum(ch.isalpha() for ch in chunk)
-        if not chunk.replace("-", "").replace("_", "").isascii():
-            continue
-        if alnum < len(chunk) * 0.8:
-            continue
-        # 英字と数字が偏った長い塊、あるいはエントロピーが高い = 鍵の疑いが濃い
-        if letters and digits and (digits / max(alnum, 1)) > 0.35:
-            return True
-        counts = {ch: chunk.count(ch) for ch in set(chunk)}
-        entropy = -sum((c / len(chunk)) * math.log2(c / len(chunk)) for c in counts.values())
-        if len(chunk) >= 32 and entropy > 4.0:
-            return True
-    return False
 
 
 _service: ChatService | None = None
