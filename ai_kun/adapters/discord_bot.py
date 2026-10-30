@@ -11,6 +11,7 @@ from ..chat import ChatService
 from ..config import Settings
 from ..errors import AIKunError, InvalidInputError
 from ..observability import metrics
+from ..work_queue import WorkQueue
 
 logger = logging.getLogger(__name__)
 MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
@@ -44,9 +45,7 @@ class RestrictedTree(app_commands.CommandTree):
         return True
 
     async def on_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
-        if isinstance(error, app_commands.CommandOnCooldown):
-            message = "少し待ってからもう一回試してください。"
-        elif isinstance(error, app_commands.MissingPermissions):
+        if isinstance(error, app_commands.MissingPermissions):
             message = "この操作には「サーバー管理」権限が必要です。"
         else:
             logger.warning("command failed: %s", type(error).__name__)
@@ -68,7 +67,8 @@ class AIKunClient(discord.Client):
         )
         self.settings = settings
         self.service = service
-        self.busy = asyncio.Lock()
+        self._response_queue = WorkQueue()
+        self._message_tasks: set[asyncio.Task] = set()
         self.tree = RestrictedTree(self)
         self._register_commands()
 
@@ -82,20 +82,28 @@ class AIKunClient(discord.Client):
         metrics.increment("ai_kun.discord_connections_total")
 
     async def _run(self, operation: Callable[[], Awaitable[str]]) -> str:
-        if self.busy.locked():
-            return "いま別の返事を考えています。少し待ってから試してください。"
-        async with self.busy:
-            try:
-                return await asyncio.wait_for(operation(), timeout=240)
-            except AIKunError as exc:
-                return exc.user_message()
-            except TimeoutError:
-                return "時間がかかりすぎたため中断しました。少し待ってから試してください。"
-            except Exception as exc:
-                # 例外本文は外部レスポンスや秘密を含む場合があるため出さない。
-                logger.warning("request failed: %s", type(exc).__name__)
-                metrics.increment("ai_kun.failures_total")
-                return "処理に失敗しました。管理者に設定の確認をお願いしてください。"
+        return await self._response_queue.submit(lambda: self._execute(operation))
+
+    async def _execute(self, operation: Callable[[], Awaitable[str]]) -> str:
+        # キュー待機時間は実行タイムアウトへ含めない。
+        try:
+            return await asyncio.wait_for(operation(), timeout=240)
+        except AIKunError as exc:
+            return exc.user_message()
+        except TimeoutError:
+            return "時間がかかりすぎたため中断しました。少し待ってから試してください。"
+        except Exception as exc:
+            # 例外本文は外部レスポンスや秘密を含む場合があるため出さない。
+            logger.warning("request failed: %s", type(exc).__name__)
+            metrics.increment("ai_kun.failures_total")
+            return "処理に失敗しました。管理者に設定の確認をお願いしてください。"
+
+    async def drain(self):
+        # 接続終了後も、受付済みメッセージから後続の取り込みがキューへ入るまで待つ。
+        if self._message_tasks:
+            await asyncio.gather(*self._message_tasks, return_exceptions=True)
+        await self._response_queue.join()
+        await self.service.drain()
 
     async def _answer(self, interaction: discord.Interaction, operation, *, ephemeral=False) -> None:
         await interaction.response.defer(thinking=True, ephemeral=ephemeral)
@@ -106,7 +114,6 @@ class AIKunClient(discord.Client):
     def _register_commands(self) -> None:
         @self.tree.command(name="ask", description="AIくんに質問する（会話は自動保存しません）")
         @app_commands.describe(question="質問内容")
-        @app_commands.checks.cooldown(1, 5, key=lambda i: i.user.id)
         async def ask(interaction: discord.Interaction, question: str):
             async def operation():
                 return (await self.service.generate_reply(question)).content
@@ -116,7 +123,6 @@ class AIKunClient(discord.Client):
         @self.tree.command(name="search_memory", description="保存記憶を検索して管理者にだけ表示する")
         @app_commands.default_permissions(manage_guild=True)
         @app_commands.checks.has_permissions(manage_guild=True)
-        @app_commands.checks.cooldown(1, 5, key=lambda i: i.user.id)
         @app_commands.describe(query="検索語")
         async def search_memory(interaction: discord.Interaction, query: str):
             async def operation():
@@ -129,7 +135,6 @@ class AIKunClient(discord.Client):
 
         @self.tree.command(name="remember", description="指定した内容をサーバー共通の記憶に保存する")
         @app_commands.describe(text="保存するテキスト。許可チャンネルの利用者全員が参照できます")
-        @app_commands.checks.cooldown(1, 10, key=lambda i: i.user.id)
         async def remember(interaction: discord.Interaction, text: str):
             async def operation():
                 result = await self.service.remember(text)
@@ -160,11 +165,19 @@ class AIKunClient(discord.Client):
             await self._answer(interaction, operation, ephemeral=True)
 
     async def on_message(self, message: discord.Message) -> None:
+        task = asyncio.current_task()
+        self._message_tasks.add(task)
+        try:
+            await self._handle_message(message)
+        finally:
+            self._message_tasks.discard(task)
+
+    async def _handle_message(self, message: discord.Message) -> None:
         if message.author.bot or not allowed(self.settings, message.guild.id if message.guild else None):
             return
 
         # 全メッセージ収集：フック（メンション・!ai・/ask）の有無や内容に関係なく、
-        # サーバー内の人間の発言は即座にRAG記憶へ取り込む。失敗しても返信処理は続行。
+        # サーバー内の人間の発言は受付順にRAG記憶へ取り込む。失敗しても返信処理は続行。
         try:
             await self.service.ingest_message(message)
         except Exception as exc:  # 取り込み失敗を返信やログには出す。本文は出さない。

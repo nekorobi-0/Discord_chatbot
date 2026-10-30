@@ -20,6 +20,7 @@ from .ingestion import stored_status
 from .memory import MemoryStore
 from .observability import AuditLog, metrics
 from .tools import ToolHub
+from .work_queue import WorkQueue
 
 logger = logging.getLogger("ai_kun.chat")
 
@@ -69,8 +70,7 @@ class ChatService:
             memory=settings.memory,
         )
         self._reply_lock = asyncio.Lock()
-        self._backfill_lock = asyncio.Lock()
-        self._backfill_channels: set[int] = set()
+        self._backfill_queue = WorkQueue()
         self._tools = ToolHub(search=settings.search, memory=self._memory)
 
     # ---------- 音声 ----------
@@ -130,27 +130,26 @@ class ChatService:
         """フック有無に関係なく観測したチャンネルの未保存分を、自動で巻き戻し取り込みする。"""
         if not self._settings.memory.enabled:
             raise UpstreamError("記憶")
-        channel_id = int(channel_id)
-        if channel_id in self._backfill_channels:
-            return {"scanned": 0, "imported": 0, "skipped": 0, "documents": 0}
-        self._backfill_channels.add(channel_id)
-        try:
-            async with self._backfill_lock:
-                return await self._backfill_channel(channel_id, api=api)
-        finally:
-            self._backfill_channels.discard(channel_id)
-
-    async def _backfill_channel(self, channel_id: int, *, api=None) -> dict[str, int]:
         from .history import backfill_channel as _backfill
 
-        job = self._memory.ingestion.start(self._settings.discord.guild_id, channel_id, "backfill")
-        try:
-            result = await _backfill(self._settings, self._memory, int(channel_id), api=api)
-        except BaseException as exc:
-            self._memory.ingestion.finish(job, error=type(exc).__name__)
-            raise
-        self._memory.ingestion.finish(job, result=result)
-        return result
+        channel_id = int(channel_id)
+        job = self._memory.ingestion.start(self._settings.discord.guild_id, channel_id, "backfill", queued=True)
+
+        async def operation():
+            self._memory.ingestion.running(job)
+            try:
+                result = await _backfill(self._settings, self._memory, channel_id, api=api)
+            except BaseException as exc:
+                self._memory.ingestion.finish(job, error=type(exc).__name__)
+                raise
+            self._memory.ingestion.finish(job, result=result)
+            return result
+
+        return await self._backfill_queue.submit(operation)
+
+    async def drain(self) -> None:
+        await self._backfill_queue.join()
+        await self._memory.ingestion_queue.join()
 
     async def ingestion_status(self) -> dict:
         settings = self._settings

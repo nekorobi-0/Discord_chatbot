@@ -119,7 +119,7 @@ def test_monitor_history_is_bounded():
     for _ in range(110):
         monitor.finish(monitor.start(1, 2, "messages", 1), result={"imported": 1})
     assert len(monitor.snapshot(1)["recent"]) == 100
-    assert monitor.snapshot(2) == {"active": [], "recent": []}
+    assert monitor.snapshot(2) == {"active": [], "queued": [], "queued_count": 0, "recent": []}
 
 
 async def test_cancelled_ingestion_does_not_remain_active(settings, store, monkeypatch):
@@ -140,3 +140,53 @@ async def test_backfill_failure_is_visible(settings, store, monkeypatch):
     assert status["active"] == []
     assert status["recent"][0]["kind"] == "backfill"
     assert status["recent"][0]["status"] == "failed"
+
+
+async def test_message_queue_preserves_all_messages_and_survives_cancelled_waiter(settings, store, monkeypatch):
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def embed(texts):
+        calls.extend(texts)
+        entered.set()
+        await release.wait()
+        return [[1.0] + [0.0] * 63 for _ in texts]
+
+    monkeypatch.setattr(store, "embed", embed)
+    tasks = [asyncio.create_task(store.ingest_history_page(23456, 34567, [message("100")]))]
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        for message_id in ("101", "102", "103"):
+            tasks.append(asyncio.create_task(store.ingest_history_page(23456, 34567, [message(message_id)])))
+            await asyncio.sleep(0)
+        status = await ChatService(settings, store).ingestion_status()
+        assert len(status["active"]) == 1
+        assert len(status["queued"]) == 3
+        assert status["stored"]["processed"] == 0
+        tasks[2].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await tasks[2]
+        release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await store.ingestion_queue.join()
+        final = await ChatService(settings, store).ingestion_status()
+        assert final["stored"]["searchable"] == 4
+        assert final["stored"]["processed"] == 4
+        assert final["active"] == final["queued"] == []
+        assert len(final["recent"]) == 4
+        assert len(calls) == 4
+    finally:
+        release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await store.ingestion_queue.join()
+
+
+def test_pending_queue_count_includes_jobs_beyond_display_limit():
+    monitor = IngestionMonitor()
+    for _ in range(110):
+        monitor.start(1, 2, "messages", 1, queued=True)
+    snapshot = monitor.snapshot(1)
+    assert snapshot["queued_count"] == 110
+    assert len(snapshot["queued"]) == 100
+    assert snapshot["active"] == []
+    assert snapshot["recent"] == []

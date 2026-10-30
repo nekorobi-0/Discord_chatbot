@@ -62,8 +62,11 @@ async def run(settings, service) -> None:
         async with client:
             await client.start(settings.discord.bot_token)
     finally:
-        if runner:
-            await runner.cleanup()
+        try:
+            await client.drain()
+        finally:
+            if runner:
+                await runner.cleanup()
 
 
 if __name__ == "__main__":

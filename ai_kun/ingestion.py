@@ -17,7 +17,7 @@ class IngestionMonitor:
         self._active = {}
         self._recent = deque(maxlen=100)
 
-    def start(self, guild_id: int, channel_id: int, kind: str, count: int = 0) -> str:
+    def start(self, guild_id: int, channel_id: int, kind: str, count: int = 0, *, queued: bool = False) -> str:
         job_id = uuid4().hex
         with self._lock:
             self._active[job_id] = {
@@ -25,11 +25,16 @@ class IngestionMonitor:
                 "guild_id": str(guild_id),
                 "channel_id": str(channel_id),
                 "kind": kind,
-                "status": "running",
+                "status": "queued" if queued else "running",
                 "messages": count,
-                "started_at": datetime.now(UTC).isoformat(),
+                "accepted_at": datetime.now(UTC).isoformat(),
+                "started_at": None if queued else datetime.now(UTC).isoformat(),
             }
         return job_id
+
+    def running(self, job_id: str):
+        with self._lock:
+            self._active[job_id].update(status="running", started_at=datetime.now(UTC).isoformat())
 
     def finish(self, job_id: str, *, result=None, error: str | None = None):
         with self._lock:
@@ -44,8 +49,12 @@ class IngestionMonitor:
 
     def snapshot(self, guild_id: int) -> dict:
         with self._lock:
+            active = [job for job in self._active.values() if job["guild_id"] == str(guild_id)]
+            queued = [job for job in active if job["status"] == "queued"]
             return {
-                "active": [dict(job) for job in self._active.values() if job["guild_id"] == str(guild_id)],
+                "active": [dict(job) for job in active if job["status"] == "running"],
+                "queued": [dict(job) for job in queued[:100]],
+                "queued_count": len(queued),
                 "recent": [dict(job) for job in self._recent if job["guild_id"] == str(guild_id)],
             }
 

@@ -38,6 +38,7 @@ from .db import (
 )
 from .errors import InvalidInputError, RateLimitError, UpstreamError
 from .ingestion import IngestionMonitor
+from .work_queue import WorkQueue
 
 logger = logging.getLogger("ai_kun.memory")
 
@@ -101,6 +102,7 @@ class MemoryStore:
         self._asr = asr
         self._memory = memory
         self.ingestion = IngestionMonitor()
+        self.ingestion_queue = WorkQueue()
         init_db()
 
     # ---------- HTTP（SSRF 対策つき）----------
@@ -352,14 +354,19 @@ class MemoryStore:
         return {"chunks": len(chunks), "document_id": document_id}
 
     async def ingest_history_page(self, guild_id: int, channel_id: int, messages: list[dict]) -> dict[str, int]:
-        job = self.ingestion.start(guild_id, channel_id, "messages", len(messages))
-        try:
-            result = await self._ingest_history_page(guild_id, channel_id, messages)
-        except BaseException as exc:
-            self.ingestion.finish(job, error=type(exc).__name__)
-            raise
-        self.ingestion.finish(job, result=result)
-        return result
+        job = self.ingestion.start(guild_id, channel_id, "messages", len(messages), queued=True)
+
+        async def operation():
+            self.ingestion.running(job)
+            try:
+                result = await self._ingest_history_page(guild_id, channel_id, messages)
+            except BaseException as exc:
+                self.ingestion.finish(job, error=type(exc).__name__)
+                raise
+            self.ingestion.finish(job, result=result)
+            return result
+
+        return await self.ingestion_queue.submit(operation)
 
     async def _ingest_history_page(self, guild_id: int, channel_id: int, messages: list[dict]) -> dict[str, int]:
         """20発言・30分・文字数を目安にまとめる。ページ保存と進捗は原子的に更新。"""

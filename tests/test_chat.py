@@ -183,7 +183,7 @@ async def test_local_llm_without_key_and_without_budget(settings, store, monkeyp
     assert not (Path(os.environ["DATA_DIR"]) / "budget.sqlite3").exists()
 
 
-async def test_backfill_coalesces_same_channel_and_serializes_others(settings, store, monkeypatch):
+async def test_backfill_queues_all_requests_including_same_channel(settings, store, monkeypatch):
     import asyncio
 
     entered, release = asyncio.Event(), asyncio.Event()
@@ -192,29 +192,27 @@ async def test_backfill_coalesces_same_channel_and_serializes_others(settings, s
 
     async def backfill(settings, memory, channel_id, *, api=None):
         calls.append(channel_id)
-        if channel_id == 34567:
-            entered.set()
-            await release.wait()
+        entered.set()
+        await release.wait()
         return dict(totals)
 
     monkeypatch.setattr("ai_kun.history.backfill_channel", backfill)
     service = ChatService(settings, store)
-    first = asyncio.create_task(service.backfill_channel(34567))
-    second = None
+    tasks = [asyncio.create_task(service.backfill_channel(34567))]
     try:
         await asyncio.wait_for(entered.wait(), timeout=2)
-        duplicate = await service.backfill_channel(34567)
-        assert duplicate == {"scanned": 0, "imported": 0, "skipped": 0, "documents": 0}
-        second = asyncio.create_task(service.backfill_channel(34568))
-        await asyncio.sleep(0)
+        for channel in (34567, 34568):
+            tasks.append(asyncio.create_task(service.backfill_channel(channel)))
+            await asyncio.sleep(0)
         assert calls == [34567]
+        assert not any(task.done() for task in tasks)
+        pending = store.ingestion.snapshot(23456)
+        assert len(pending["queued"]) == 2
+        assert len(pending["active"]) == 1
         release.set()
-        assert await first == totals
-        assert await second == totals
-        assert calls == [34567, 34568]
-        assert service._backfill_channels == set()
+        assert await asyncio.gather(*tasks) == [totals, totals, totals]
+        assert calls == [34567, 34567, 34568]
+        assert store.ingestion.snapshot(23456)["queued"] == []
     finally:
         release.set()
-        await first
-        if second is not None:
-            await second
+        await asyncio.gather(*tasks, return_exceptions=True)

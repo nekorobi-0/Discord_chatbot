@@ -184,3 +184,64 @@ async def test_http_unconfigured_and_disconnected(settings):
         assert (await client.get("/healthz")).status == 503
         assert (await client.get("/metrics/v1")).status == 200
         assert (await client.get("/dashboard")).status == 200
+
+
+async def test_reply_requests_wait_in_queue_instead_of_being_rejected(settings, store):
+    import asyncio
+
+    client = AIKunClient(settings, ChatService(settings, store))
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def operation(index):
+        calls.append(index)
+        entered.set()
+        await release.wait()
+        return f"reply-{index}"
+
+    tasks = [asyncio.create_task(client._run(lambda: operation(0)))]
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        for index in range(1, 4):
+            tasks.append(asyncio.create_task(client._run(lambda index=index: operation(index))))
+            await asyncio.sleep(0)
+        assert calls == [0]
+        assert not any(task.done() for task in tasks)
+        release.set()
+        assert await asyncio.gather(*tasks) == [f"reply-{index}" for index in range(4)]
+        assert calls == [0, 1, 2, 3]
+    finally:
+        release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await client.drain()
+        await client.close()
+
+
+async def test_shutdown_waits_for_accepted_message_handlers(settings, store, monkeypatch):
+    import asyncio
+
+    client = AIKunClient(settings, ChatService(settings, store))
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def handle(message):
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(client, "_handle_message", handle)
+    task = asyncio.create_task(client.on_message(SimpleNamespace()))
+    draining = None
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        draining = asyncio.create_task(client.drain())
+        await asyncio.sleep(0)
+        assert not draining.done()
+        release.set()
+        await task
+        await draining
+        assert client._message_tasks == set()
+    finally:
+        release.set()
+        await task
+        if draining is not None:
+            await draining
+        await client.close()
