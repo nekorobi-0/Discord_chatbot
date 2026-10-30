@@ -1,7 +1,8 @@
 """AIくんの記憶（RAG）レイヤー。
 
 - 検索は NumPy のバッチ演算で埋め込み近傍を計算する。総当たりの純Python演算は使わない
-- 保存した本文・ベクトルから復号なしに検索できる
+- 保存した本文・ベクトルは平文のまま検索対象として扱う
+- LLM / Embedding への要求は設定済みの社内・ローカル中継先だけに限定し、数値アドレスはプライベート範囲へ固定する
 - LLM / Embedding は互換API、ASRはローカル推論
 """
 
@@ -10,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import ipaddress
 import logging
 import os
 import re
@@ -17,6 +19,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from urllib.parse import urlparse
 
 import httpx
 import numpy as np
@@ -74,6 +77,18 @@ def _sanitize_text(text: str) -> str:
     return cleaned.strip()
 
 
+def _looks_like_literal(value: str) -> bool:
+    """数値アドレス（ゾーン指定付きを含む）かどうかを判定する。名前は True を返さない。"""
+    candidate = value.strip("[]")
+    if "%" in candidate:  # fe80::1%eth0 のような系統指定付きは数値表記として扱う
+        candidate = candidate.split("%", 1)[0]
+    try:
+        ipaddress.ip_address(candidate)
+    except ValueError:
+        return False
+    return True
+
+
 class MemoryStore:
     """記憶の保存・検索・推論をまとめる唯一の窓口。"""
 
@@ -87,11 +102,60 @@ class MemoryStore:
         init_db()
 
     # ---------- HTTP（SSRF 対策つき）----------
+    # 平文 HTTP を認める先は、RFC で割り当てられた社内・ローカル範囲だけにする。
+    # ipaddress の is_private / is_reserved は試験用（TEST-NET）・予約済み・6to4 ・IPv4 変換範囲を
+    # 「社内」と判定してしまうため、ここでは承認対象を明示的な接頭語で列挙し、それ以外は全て拒否する。
+    _INTERNAL_V4_PREFIXES = tuple(
+        ipaddress.ip_network(prefix)
+        for prefix in (
+            "10.0.0.0/8",  # RFC1918 私用範囲
+            "172.16.0.0/12",  # RFC1918 私用範囲
+            "192.168.0.0/16",  # RFC1918 私用範囲
+            "127.0.0.0/8",  # ループバック
+            "169.254.0.0/16",  # リンクローカル
+            "100.64.0.0/10",  # キャリアグレード NAT（社内中継で使うため承認）
+        )
+    )
+    _INTERNAL_V6_PREFIXES = tuple(
+        ipaddress.ip_network(prefix)
+        for prefix in (
+            "::1/128",  # ループバック
+            "fc00::/7",  # 一意ローカルアドレス（社内 IPv6）
+            "fe80::/10",  # リンクローカル
+        )
+    )
+
+    @classmethod
+    def _is_internal_ip(cls, literal: str) -> bool:
+        """ゾーン指定のない数値アドレスが、承認済みの社内・ローカル範囲に属するかを判定する。"""
+        try:
+            address = ipaddress.ip_address(literal.strip("[]"))
+        except ValueError:
+            return False
+        if getattr(address, "scope_id", None) or getattr(address, "scope_zone", ""):
+            return False
+        prefixes = cls._INTERNAL_V4_PREFIXES if address.version == 4 else cls._INTERNAL_V6_PREFIXES
+        return any(address in prefix for prefix in prefixes)
+
     async def _request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
-        if not any(
-            url == base.rstrip("/") + suffix
-            for base, suffix in ((self._llm.base_url, "/chat/completions"), (self._embedding.base_url, "/embeddings"))
+        base = None
+        for candidate, suffix in (
+            (self._llm.base_url, "/chat/completions"),
+            (self._embedding.base_url, "/embeddings"),
         ):
+            if url == candidate.rstrip("/") + suffix:
+                base = candidate.rstrip("/")
+                break
+        if base is None:
+            raise UpstreamError("外部サービス")
+
+        # 設定済みの宛先そのものへしか要求を飛ばさない。HTTPS はそのまま通し、
+        # 平文 HTTP は設定値が数値アドレスのときだけ社内・ローカル範囲であることを必須条件にする。
+        target = urlparse(url)
+        if target.scheme not in {"http", "https"}:
+            raise UpstreamError("外部サービス")
+        literal = (urlparse(base).hostname or "").lower()
+        if target.scheme == "http" and _looks_like_literal(literal) and not self._is_internal_ip(literal):
             raise UpstreamError("外部サービス")
         try:
             async with httpx.AsyncClient(timeout=float(self._llm.timeout_seconds), follow_redirects=False) as client:
@@ -100,7 +164,6 @@ class MemoryStore:
             logger.warning("upstream transport error: %s", type(exc).__name__)
             raise UpstreamError("外部サービス") from exc
 
-    # ---------- LLM 推論 ----------
     async def complete_chat(
         self,
         messages: Sequence[Mapping[str, object]],

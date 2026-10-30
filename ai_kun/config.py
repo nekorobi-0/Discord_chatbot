@@ -83,29 +83,64 @@ def _float(name: str, default: float, minimum: float, maximum: float) -> float:
     return value
 
 
+# 平文 HTTP を認める宛先は、RFC で割り当てられた社内・ローカル範囲だけに限定する。
+# ipaddress の is_private / is_reserved は試験用（TEST-NET: 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24）、
+# 予約済み（240.0.0.0/4）・6to4・IPv4 変換範囲を「社内」と誤判定するため、承認対象を明示的な接頭語で列挙する。
+_INTERNAL_V4_PREFIXES = tuple(
+    ipaddress.ip_network(prefix)
+    for prefix in (
+        "10.0.0.0/8",  # RFC1918 私用範囲
+        "172.16.0.0/12",  # RFC1918 私用範囲
+        "192.168.0.0/16",  # RFC1918 私用範囲
+        "127.0.0.0/8",  # ループバック
+        "169.254.0.0/16",  # リンクローカル
+        "100.64.0.0/10",  # キャリアグレード NAT（社内中継で使うため承認）
+    )
+)
+_INTERNAL_V6_PREFIXES = tuple(
+    ipaddress.ip_network(prefix)
+    for prefix in (
+        "::1/128",  # ループバック
+        "fc00::/7",  # 一意ローカルアドレス（社内 IPv6）
+        "fe80::/10",  # リンクローカル
+    )
+)
+_INTERNAL_HOSTNAMES = frozenset({"localhost", "localhost.localdomain", "host.docker.internal", "ip6-loopback"})
+
+
+def _is_internal_host(host: str) -> bool:
+    """社内・ローカル中継先として承認済みかどうかを判定する。名前解決は要求しない。"""
+    candidate = host.strip("[]").lower()
+    if "%" in candidate:  # ゾーン指定付き（fe80::1%eth0 など）は承認対象外
+        return False
+    if candidate in _INTERNAL_HOSTNAMES:
+        return True
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        return False
+    prefixes = _INTERNAL_V4_PREFIXES if address.version == 4 else _INTERNAL_V6_PREFIXES
+    return any(address in prefix for prefix in prefixes)
+
+
 def _https_base_url(name: str, default: str = "") -> str:
     raw = _raw(name) or default
     if not raw:
         raise ConfigurationError(f"{name} が設定されてないみたい。管理者にたずねてくれる？")
     parsed = urlparse(raw)
     host = (parsed.hostname or "").lower()
-    is_loopback = False
-    if host in {"localhost", "localhost.localdomain", "host.docker.internal"}:
-        is_loopback = True
-    else:
-        try:
-            is_loopback = ipaddress.ip_address(host).is_loopback
-        except ValueError:
-            is_loopback = False
 
     try:
         _ = parsed.port
     except ValueError as exc:
         raise ConfigurationError(f"{name} のポート番号が不正です。") from exc
     valid = host and not parsed.username and not parsed.password and not parsed.query and not parsed.fragment
-    if valid and (parsed.scheme == "https" or (parsed.scheme == "http" and is_loopback)):
+    # https は常時可。http は RFC 1918 を含むプライベート・ローカル範囲のときだけ許す。
+    if valid and (parsed.scheme == "https" or (parsed.scheme == "http" and _is_internal_host(host))):
         return raw.rstrip("/")
-    raise ConfigurationError(f"{name} は HTTPS URL（ローカルのみ HTTP 可）で指定してください。")
+    raise ConfigurationError(
+        f"{name} は HTTPS URL、または社内・ローカル（プライベートアドレス）向けの HTTP URL で指定してください。"
+    )
 
 
 def _model_id(name: str, default: str = "") -> str:
