@@ -277,25 +277,17 @@ class MemorySettings:
 class OperationalSettings:
     audit_log_enabled: bool = True
     max_output_chars: int = 1_800
-    dashboard_username: str = field(repr=False, default="")
-    dashboard_password: str = field(repr=False, default="")
-    http_enabled: bool = False
-    http_host: str = "127.0.0.1"
+    http_enabled: bool = True
+    http_host: str = "0.0.0.0"
     http_port: int = 8080
 
     @classmethod
     def from_env(cls) -> OperationalSettings:
-        username = _secret("DASHBOARD_USERNAME")
-        password = _secret("DASHBOARD_PASSWORD")
-        if bool(username) != bool(password):
-            raise ConfigurationError("ダッシュボードのユーザー名とパスワードは両方設定してください。")
         return cls(
             audit_log_enabled=_bool("AUDIT_LOG_ENABLED", True),
             max_output_chars=_int("MAX_OUTPUT_CHARS", 1_800, 200, 1_900),
-            dashboard_username=username,
-            dashboard_password=password,
-            http_enabled=_bool("HTTP_ENABLED", False),
-            http_host=_raw("HTTP_HOST") or "127.0.0.1",
+            http_enabled=_bool("HTTP_ENABLED", True),
+            http_host=_raw("HTTP_HOST") or "0.0.0.0",
             http_port=_int("HTTP_PORT", 8080, 1, 65535),
         )
 

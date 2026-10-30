@@ -178,21 +178,21 @@ LLMの利用量に応じた日次制限はありません。
 
 `MAX_OUTPUT_CHARS` は200〜1900文字、既定1800文字。絵文字を含む返答はDiscord上限に合わせて複数投稿になる場合があります。
 
-## 運用HTTP（任意）
+## Web UI（デフォルト有効・認証不要）
+
+起動後、`http://localhost:8080/` または `http://サーバーのIP:8080/` で運用画面を開けます。ユーザー名・パスワードは不要です。
 
 ```dotenv
 HTTP_ENABLED=true
-HTTP_HOST=127.0.0.1
+HTTP_HOST=0.0.0.0
 HTTP_PORT=8080
-DASHBOARD_USERNAME=admin
-DASHBOARD_PASSWORD=十分に長い専用パスワード
 ```
 
-- `GET /healthz`: 認証不要。Discord接続完了なら200、未接続なら503
-- `GET /dashboard`: Basic認証付きの運用リンク画面
-- `GET /metrics/v1`: Basic認証付きのJSONメトリクス
+- `GET /` / `GET /dashboard`: 運用リンク画面
+- `GET /healthz`: Discord接続完了なら200、未接続なら503
+- `GET /metrics/v1`: JSONメトリクス
 
-ユーザー名とパスワードの両方が空なら、画面とメトリクスは404です。どちらか片方だけの設定は起動エラーになります。メトリクスのカウンターはプロセス再起動でリセットされます。HTTPを有効にしてもLLM生成APIは公開しません。標準はlocalhostのみ。外部公開する場合はTLS終端とアクセス制限を別途用意してください。
+すべて認証不要です。無効にする場合は `HTTP_ENABLED=false` を設定します。旧 `.env` にこの値がある場合も引き続き無効になるので、有効化には `true` に変更してください。旧 `DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD` は使用しません。メトリクスのカウンターはプロセス再起動でリセットされます。この画面からLLMへのチャットや設定変更はできません。
 
 ## Docker
 
@@ -209,7 +209,7 @@ docker compose down
 
 コンテナは非rootで動き、`.env` はビルドコンテキストから除外します。埋め込みイメージの取得ステップにだけBuildKit secretとしてマウントし、`HF_TOKEN` を読み取ります。トークンをDockerのARG・ENV・レイヤーに保存せず、起動時のモデル取得も行いません。Botの設定は起動時に渡します。データは `bot-data` 名前付きボリュームです。ホストの `./data` とは別です。ボリューム削除は記憶も削除します。
 
-Compose構成はHTTPポートを公開しません。利用する場合はHTTPホストを `0.0.0.0` に変更し、ホストのlocalhostに限定するポートマッピング（例: `127.0.0.1:8080:8080`）を追加してください。
+ComposeはWeb UIのポート（既定8080）を公開します。Botとネットワーク名前空間を共有しているため、ポートマッピングは `embedding` サービスに設定しています。コンテナ内のHTTP待ち受けは `0.0.0.0` です。
 
 APIベースURLはHTTPS、またはループバック・RFC1918のプライベートIPv4アドレスへのHTTPを指定できます。HTTPで許可する範囲は `127.0.0.0/8`、`::1`、`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16` と、承認済みホスト名 `localhost` / `localhost.localdomain` / `ip6-loopback` です。例えば `http://192.168.0.123:8080/v1` を使用できます。CGNAT・リンクローカル・公開IP・その他のホスト名はHTTPでは許可しません。設定時とAPI送信時には同じ宛先判定を使用し、URLの書き換えやリダイレクトは行いません。
 
@@ -241,7 +241,7 @@ uv run ruff check ai_kun tests
 uv run ruff format --check ai_kun tests
 ```
 
-テストは一時DBと模擬APIを使用します。設定検証、登録・再起動・検索・削除、履歴のページング・重複防止・再開、Discordのレート制限追従・429待機、API送信前のマスキング、ツール呼び出し、Discordの許可判定、HTTP認証を確認します。Discord実サーバー・外部LLM・Tavily・ASRモデルの実機疎通は別途必要です。
+テストは一時DBと模擬APIを使用します。設定検証、登録・再起動・検索・削除、履歴のページング・重複防止・再開、Discordのレート制限追従・429待機、API送信前のマスキング、ツール呼び出し、Discordの許可判定、認証不要のWeb UIを確認します。Discord実サーバー・外部LLM・Tavily・ASRモデルの実機疎通は別途必要です。
 
 ## 困ったとき
 

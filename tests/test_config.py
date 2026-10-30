@@ -70,11 +70,17 @@ def test_invalid_chunk_overlap(monkeypatch):
         MemorySettings.from_env()
 
 
-def test_dashboard_requires_both_credentials(monkeypatch):
-    monkeypatch.setenv("DASHBOARD_USERNAME", "admin")
-    monkeypatch.setenv("DASHBOARD_PASSWORD", "")
-    with pytest.raises(ConfigurationError):
-        OperationalSettings.from_env()
+def test_web_ui_defaults_to_enabled_without_credentials(monkeypatch):
+    for name in ("HTTP_ENABLED", "HTTP_HOST", "HTTP_PORT"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("DASHBOARD_USERNAME", "old-unused-setting")
+    monkeypatch.delenv("DASHBOARD_PASSWORD", raising=False)
+    settings = OperationalSettings.from_env()
+    assert settings.http_enabled is True
+    assert settings.http_host == "0.0.0.0"
+    assert settings.http_port == 8080
+    monkeypatch.setenv("HTTP_ENABLED", "false")
+    assert OperationalSettings.from_env().http_enabled is False
 
 
 def test_local_config_without_api_keys(monkeypatch):

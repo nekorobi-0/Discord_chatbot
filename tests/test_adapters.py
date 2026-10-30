@@ -1,5 +1,3 @@
-import base64
-from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -167,31 +165,22 @@ async def test_mention_and_prefix_reply(settings, store, monkeypatch):
     await client.close()
 
 
-async def test_http_auth_and_health(settings):
-    operational = replace(settings.operational, dashboard_username="admin", dashboard_password="secret")
-    app = create_app(replace(settings, operational=operational), SimpleNamespace(is_ready=lambda: True))
+async def test_http_dashboard_and_metrics_without_auth(settings):
+    app = create_app(settings, SimpleNamespace(is_ready=lambda: True))
     async with TestClient(TestServer(app)) as client:
         assert (await client.get("/healthz")).status == 200
-        assert (await client.get("/metrics/v1")).status == 401
-        assert (
-            await client.get(
-                "/dashboard", headers={"Authorization": "Basic " + base64.b64encode(b"admin:wrong").decode()}
-            )
-        ).status == 401
-        response = await client.get(
-            "/metrics/v1", headers={"Authorization": "Basic " + base64.b64encode(b"admin:secret").decode()}
-        )
+        for path in ("/", "/dashboard"):
+            response = await client.get(path)
+            assert response.status == 200
+            assert "AIくん 運用情報" in await response.text()
+        response = await client.get("/metrics/v1")
         assert response.status == 200
         assert set(await response.json()) == {"counters"}
-        assert (
-            await client.get(
-                "/dashboard", headers={"Authorization": "Basic " + base64.b64encode(b"admin:secret").decode()}
-            )
-        ).status == 200
 
 
 async def test_http_unconfigured_and_disconnected(settings):
     app = create_app(settings, SimpleNamespace(is_ready=lambda: False))
     async with TestClient(TestServer(app)) as client:
         assert (await client.get("/healthz")).status == 503
-        assert (await client.get("/metrics/v1")).status == 404
+        assert (await client.get("/metrics/v1")).status == 200
+        assert (await client.get("/dashboard")).status == 200

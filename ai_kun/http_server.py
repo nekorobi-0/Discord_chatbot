@@ -1,7 +1,4 @@
-"""任意のローカル運用エンドポイント。生成・登録APIは公開しない。"""
-
-import base64
-import hmac
+"""認証不要の運用エンドポイント。生成・登録APIは公開しない。"""
 
 from aiohttp import web
 
@@ -9,21 +6,7 @@ from .observability import metrics
 
 
 def create_app(settings, client):
-    operational = settings.operational
-
-    @web.middleware
-    async def auth(request, handler):
-        if request.path != "/healthz":
-            username, password = operational.dashboard_username, operational.dashboard_password
-            if not username or not password:
-                raise web.HTTPNotFound()
-            expected = base64.b64encode(f"{username}:{password}".encode()).decode()
-            supplied = request.headers.get("Authorization", "")
-            if not hmac.compare_digest(supplied.encode(), f"Basic {expected}".encode()):
-                raise web.HTTPUnauthorized(headers={"WWW-Authenticate": 'Basic realm="AI-kun"'})
-        return await handler(request)
-
-    app = web.Application(middlewares=[auth])
+    app = web.Application()
 
     async def health(request):
         ready = client.is_ready()
@@ -46,6 +29,7 @@ def create_app(settings, client):
             content_type="text/html",
         )
 
+    app.router.add_get("/", dashboard)
     app.router.add_get("/healthz", health)
     app.router.add_get("/metrics/v1", snapshot)
     app.router.add_get("/dashboard", dashboard)
