@@ -34,9 +34,9 @@ chmod 600 .env
 | `GUILD_ID` | 利用するサーバーID |
 | `LLM_BASE_URL` | Chat Completions互換APIのベースURL。例: `http://127.0.0.1:11434/v1` |
 | `LLM_API_KEY` / `LLM_MODEL` | 認証が必要な場合のキー・導入したモデルID |
-| `EMBEDDING_MODEL` / `EMBEDDING_DIMENSION` | 埋め込みモデルIDと出力次元。既定は `gemma2`（3072次元） |
+| `EMBEDDING_MODEL` / `EMBEDDING_DIMENSION` | 埋め込みモデルIDと出力次元。既定は `embeddinggemma-2`（768次元） |
 
-`EMBEDDING_BASE_URL` と `EMBEDDING_API_KEY` が空なら、LLMと同じ設定を使います。埋め込みサービスは `/embeddings` と `dimensions` パラメータに対応し、指定次元の数値配列を返す必要があります。Embeddingの既定モデルは `gemma2` です。Chat Completions互換でないAPIはそのまま接続できません。
+`EMBEDDING_BASE_URL` と `EMBEDDING_API_KEY` が空なら、LLMと同じ設定を使います。埋め込みサービスは `/embeddings` と `dimensions` パラメータに対応し、指定次元の数値配列を返す必要があります。Embeddingの既定モデルは `embeddinggemma-2` です。Chat Completions互換でないAPIはそのまま接続できません。
 
 記憶を使わない場合は `MEMORY_ENABLED=false` にすると、Embedding設定は不要です。
 
@@ -62,7 +62,7 @@ python -m ai_kun
 
 ## ローカル推論サーバーの設定
 
-Chat Completions互換のローカル推論サーバーを起動し、導入済みのモデルIDと接続先を `.env` に設定してください。Bot自身がモデルをダウンロード・起動する処理はありません。**埋め込みは compose の `embedding` サービス（ループバック `127.0.0.1:11434`）へだけ向けます。** このサービスは GPU デバイスノードを受け渡さないため CPU でだけ推論し、GPU は使いません。既定モデルは `gemma2`（3072次元）のままです。
+Chat Completions互換のローカル推論サーバーを起動し、導入済みのモデルIDと接続先を `.env` に設定してください。Bot自身がモデルをダウンロード・起動する処理はありません。**埋め込みは compose の `embedding` サービス（ループバック `127.0.0.1:11434`）へだけ向けます。** このサービスは GPU デバイスノードを受け渡さないため CPU でだけ推論し、GPU は使いません。既定モデルは `embeddinggemma-2`（768次元）のままです。
 
 ```dotenv
 LLM_BASE_URL=http://127.0.0.1:11435/v1
@@ -70,8 +70,8 @@ LLM_API_KEY=
 LLM_MODEL=YOUR_LOCAL_CHAT_MODEL
 EMBEDDING_BASE_URL=http://127.0.0.1:11434/v1
 EMBEDDING_API_KEY=
-EMBEDDING_MODEL=gemma2
-EMBEDDING_DIMENSION=3072
+EMBEDDING_MODEL=embeddinggemma-2
+EMBEDDING_DIMENSION=768
 ```
 
 認証不要のサーバーではAPIキーは空欄で動き、Authorizationヘッダーを送信しません。埋め込みの次元数は実際のモデルの出力に合わせてください。Embeddingを使わない場合は `MEMORY_ENABLED=false` に設定します。Web検索が不要なら `WEB_SEARCH_ENABLED=false` にします。Discordへの接続にはネットワーク接続とBotトークンが必要です。
@@ -196,7 +196,7 @@ DASHBOARD_PASSWORD=十分に長い専用パスワード
 
 ## Docker
 
-Docker Composeが使える環境で、先に `.env` を設定してください。
+Docker Compose（BuildKit対応）が使える環境で、先に `.env` を設定してください。`HF_TOKEN` にHugging Faceのread権限のあるトークンを設定します。`EMBEDDING_MODEL=embeddinggemma-2` / `EMBEDDING_DIMENSION=768` を使用してください。
 
 ```bash
 docker compose build
@@ -207,7 +207,7 @@ docker compose logs -f bot
 docker compose down
 ```
 
-コンテナは非rootで動き、`.env` はビルド対象から除外して起動時に渡します。データは `bot-data` 名前付きボリュームです。ホストの `./data` とは別です。ボリューム削除は記憶も削除します。
+コンテナは非rootで動き、`.env` はビルドコンテキストから除外します。埋め込みイメージの取得ステップにだけBuildKit secretとしてマウントし、`HF_TOKEN` を読み取ります。トークンをDockerのARG・ENV・レイヤーに保存せず、起動時のモデル取得も行いません。Botの設定は起動時に渡します。データは `bot-data` 名前付きボリュームです。ホストの `./data` とは別です。ボリューム削除は記憶も削除します。
 
 Compose構成はHTTPポートを公開しません。利用する場合はHTTPホストを `0.0.0.0` に変更し、ホストのlocalhostに限定するポートマッピング（例: `127.0.0.1:8080:8080`）を追加してください。
 
@@ -222,9 +222,11 @@ Composeには `host.docker.internal:host-gateway` のマッピングを設定し
 
 ## 埋め込みサービス（CPUのみ）
 
-`compose.yaml` の `embedding` サービスが埋め込み推論を担います。GPU デバイス（`/dev/kfd`・`/dev/dri`）を受け渡さないため CPU でだけ動作し、`127.0.0.1:11434` 以外には一切公開しません。コンテナは読み取り専用ファイルシステム、全ケーパビリティ除去、`no-new-privileges`、CPU 8コア・メモリ16GB・プロセス512件の上限の下で動きます。
+`compose.yaml` の `embedding` サービスは、CPU用のllama.cppで [EmbeddingGemma 2のテキスト用GGUF](https://huggingface.co/ggml-org/embeddinggemma-2-GGUF)（BF16）を提供します。`docker compose build` の際に `.env` の `HF_TOKEN` で認証し、固定リビジョンの重みをイメージの `/models/embeddinggemma-2.gguf` に組み込みます。取得失敗やトークン未設定ならビルドは失敗します。
 
-**このホストには現在、埋め込みモデルが1つも導入されていません。** 対話用 GGUF が5件あるだけで（Qwen3.8-27B、LFM2.5-24B-A2B など）、`gemma2` を含む埋め込みモデルの重みはどこにもありません。既定の `EMBEDDING_MODEL=gemma2` / `EMBEDDING_DIMENSION=3072` を満たす重みを入れなければ、記憶の取り込みも検索も動きません。Botが自動でダウンロードすることもないため、導入は運用者の手作業です。
+Botは埋め込みサービスのネットワーク名前空間を共有し、`http://127.0.0.1:11434/v1` へ接続します。埋め込みAPIはホストやLANにポート公開せず、ヘルスチェック成功後にBotを起動します。GPUは使いません。埋め込みコンテナは非root、読み取り専用ファイルシステムで動作します。モデル用ボリュームは不要です。
+
+旧設定の `gemma2` / 3072次元を使用していた場合は `.env` も変更してください。モデル・次元が異なる既存ベクトルは検索対象外になるため、既存資料の再取り込みが必要です。
 
 ## systemd
 

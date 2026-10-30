@@ -5,8 +5,6 @@ x-runtime: &runtime
   environment:
     DATA_DIR: /app/data
     ASR_MODEL_PATH: /app/data/asr-model
-  extra_hosts:
-    - "host.docker.internal:host-gateway"
   volumes:
     - bot-data:/app/data
   init: true
@@ -15,25 +13,30 @@ x-runtime: &runtime
 services:
   bot:
     <<: *runtime
+    network_mode: "service:embedding"
+    depends_on:
+      embedding:
+        condition: service_healthy
     restart: unless-stopped
 
-  # 埋め込み推論。Embedding はこのサービスへしか行かないよう、bot の設定でループバックを指す。
-  # CPU 専用（GPU 不使用）。既定モデルは gemma2 / EMBEDDING_DIMENSION=3072 のまま変更しない。
+  # CPU専用。モデルはビルド時に取得し、実行時のダウンロードは不要。
   embedding:
-    # 同一イメージを使う。GPU デバイス（/dev/kfd・/dev/dri）を受け渡さないため、このサービスは
-    # CPU でだけ推論する。レジストリに CPU 専用タグが無いのは確認済み（0.34.0-cpu は取得不能）。
-    image: ollama/ollama:0.34.0-rocm
+    image: ai-kun-embedding:local
+    build:
+      context: .
+      dockerfile: deploy/embedding/Dockerfile
+      secrets:
+        - hf_env
     container_name: ai-kun-embedding
-    environment:
-      OLLAMA_HOST: "127.0.0.1:11434"
-      OLLAMA_NUM_PARALLEL: "1"
-      OLLAMA_MAX_LOADED_MODELS: "1"
-      OLLAMA_FLASH_ATTENTION: "0"
-    volumes:
-      - embedding-models:/root/.ollama
-    ports:
-      # bot と同じループバックにのみ公開。LAN や Docker ブリッジには一切出さない。
-      - "127.0.0.1:11434:11434"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # bot とネットワーク名前空間を共有し、ループバックだけで通信する。
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:11434/health"]
+      interval: 10s
+      timeout: 5s
+      start_period: 120s
+      retries: 12
     init: true
     read_only: true
     tmpfs:
@@ -53,4 +56,7 @@ services:
 
 volumes:
   bot-data:
-  embedding-models:
+
+secrets:
+  hf_env:
+    file: .env
