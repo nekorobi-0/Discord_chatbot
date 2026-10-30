@@ -35,9 +35,9 @@ chmod 600 .env
 | `ALLOWED_CHANNEL_IDS` | 許可チャンネルID。複数ならカンマ区切り |
 | `LLM_BASE_URL` | Chat Completions互換APIのベースURL。例: `http://127.0.0.1:11434/v1` |
 | `LLM_API_KEY` / `LLM_MODEL` | 認証が必要な場合のキー・導入したモデルID |
-| `EMBEDDING_MODEL` / `EMBEDDING_DIMENSION` | 埋め込みモデルIDと出力次元。例の値は1536次元 |
+| `EMBEDDING_MODEL` / `EMBEDDING_DIMENSION` | 埋め込みモデルIDと出力次元。既定は `gemma2`（3072次元） |
 
-`EMBEDDING_BASE_URL` と `EMBEDDING_API_KEY` が空なら、LLMと同じ設定を使います。埋め込みサービスは `/embeddings` と `dimensions` パラメータに対応し、指定次元の数値配列を返す必要があります。モデル例は利用先で使えるものに変更してください。Chat Completions互換でないAPIはそのまま接続できません。
+`EMBEDDING_BASE_URL` と `EMBEDDING_API_KEY` が空なら、LLMと同じ設定を使います。埋め込みサービスは `/embeddings` と `dimensions` パラメータに対応し、指定次元の数値配列を返す必要があります。Embeddingの既定モデルは `gemma2` です。Chat Completions互換でないAPIはそのまま接続できません。
 
 記憶を使わない場合は `MEMORY_ENABLED=false` にすると、Embedding設定は不要です。
 
@@ -71,8 +71,8 @@ LLM_API_KEY=
 LLM_MODEL=YOUR_LOCAL_CHAT_MODEL
 EMBEDDING_BASE_URL=http://127.0.0.1:11434/v1
 EMBEDDING_API_KEY=
-EMBEDDING_MODEL=YOUR_LOCAL_EMBEDDING_MODEL
-EMBEDDING_DIMENSION=1536
+EMBEDDING_MODEL=gemma2
+EMBEDDING_DIMENSION=3072
 ```
 
 認証不要のサーバーではAPIキーは空欄で動き、Authorizationヘッダーを送信しません。埋め込みの次元数は実際のモデルの出力に合わせてください。Embeddingを使わない場合は `MEMORY_ENABLED=false` に設定します。Web検索が不要なら `WEB_SEARCH_ENABLED=false` にします。Discordへの接続にはネットワーク接続とBotトークンが必要です。
