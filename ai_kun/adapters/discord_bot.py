@@ -162,6 +162,14 @@ class AIKunClient(discord.Client):
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot or not allowed(self.settings, message.guild.id if message.guild else None):
             return
+
+        # 全メッセージ収集：フック（メンション・!ai・/ask）の有無や内容に関係なく、
+        # サーバー内の人間の発言は即座にRAG記憶へ取り込む。失敗しても返信処理は続行。
+        try:
+            await self.service.ingest_message(message)
+        except Exception as exc:  # 取り込み失敗を返信やログには出す。本文は出さない。
+            logger.warning("live history ingest failed: %s", type(exc).__name__)
+
         content = message.content.strip()
         prefixes = (f"<@{self.user.id}>", f"<@!{self.user.id}>") if self.user else ()
         if content == "!ai" or content.startswith("!ai "):

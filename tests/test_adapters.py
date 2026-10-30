@@ -1,5 +1,6 @@
 import base64
 from dataclasses import replace
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -8,7 +9,17 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from ai_kun.adapters.discord_bot import AIKunClient, allowed, split_message
 from ai_kun.chat import ChatService
+from ai_kun.errors import UpstreamError
 from ai_kun.http_server import create_app
+from ai_kun.memory import ModelTurn
+
+
+class Typing:
+    async def __aenter__(self):
+        return None
+
+    async def __aexit__(self, *args):
+        return False
 
 
 def test_guild_filter(settings):
@@ -46,7 +57,6 @@ async def test_commands_registered_and_disallowed_interaction(settings, store):
         (True, 23456, 34567, "!ai hello"),
         (False, 99999, 34567, "!ai hello"),
         (False, None, 34567, "!ai hello"),
-        (False, 23456, 34567, "普通の会話"),
     ],
 )
 async def test_ignored_messages(settings, store, monkeypatch, bot, guild_id, channel_id, content):
@@ -62,6 +72,68 @@ async def test_ignored_messages(settings, store, monkeypatch, bot, guild_id, cha
     )
     await client.on_message(message)
     reply.assert_not_called()
+    await client.close()
+
+
+async def test_all_messages_ingested_without_hooks(settings, store, monkeypatch):
+    # フックとは無関係な通常会話も、受け付けると同時にRAG記憶へ収集される。
+    ingested = []
+
+    async def fake_ingest(message_obj):
+        ingested.append(str(message_obj.id))
+        return {"scanned": 1, "imported": 1, "skipped": 0, "documents": 1}
+
+    service = ChatService(settings, store)
+    monkeypatch.setattr(service, "ingest_message", fake_ingest)
+    reply = AsyncMock()
+    monkeypatch.setattr(service, "generate_reply", reply)
+    client = AIKunClient(settings, service)
+    message = SimpleNamespace(
+        id="9001",
+        author=SimpleNamespace(bot=False, id="111"),
+        guild=SimpleNamespace(id=23456),
+        channel=SimpleNamespace(id=45678, typing=Typing),
+        content="ただの雑談（フックなし）",
+        webhook_id=None,
+        created_at=datetime(2026, 10, 30, 12, 0, tzinfo=UTC),
+        attachments=[],
+    )
+    await client.on_message(message)
+    assert ingested == ["9001"]
+    # フックが無いので返信生成は走らない。
+    reply.assert_not_called()
+    await client.close()
+
+
+async def test_ingest_failure_does_not_break_hook_reply(settings, store, monkeypatch):
+    service = ChatService(settings, store)
+
+    async def broken_ingest(message_obj):
+        raise UpstreamError("Embedding")
+
+    monkeypatch.setattr(service, "ingest_message", broken_ingest)
+
+    async def complete(*args, **kwargs):
+        return ModelTurn(content="こんにちは！")
+
+    monkeypatch.setattr(store, "complete_chat", complete)
+    client = AIKunClient(settings, service)
+    reply = AsyncMock()
+    message = SimpleNamespace(
+        id="9002",
+        author=SimpleNamespace(bot=False, id="111"),
+        guild=SimpleNamespace(id=23456),
+        channel=SimpleNamespace(id=45678, typing=Typing),
+        content="!ai こんにちは",
+        webhook_id=None,
+        created_at=datetime(2026, 10, 30, 12, 0, tzinfo=UTC),
+        attachments=[],
+        reply=reply,
+    )
+    await client.on_message(message)
+    # 取り込みは失敗しても、フックへの返信は通常どおり届く。
+    reply.assert_awaited_once()
+    assert "こんにちは" in reply.await_args.args[0]
     await client.close()
 
 

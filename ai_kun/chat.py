@@ -98,6 +98,31 @@ class ChatService:
     async def remember(self, content: str) -> dict[str, int | str]:
         return await self.ingest_document("memory.txt", content.encode("utf-8"))
 
+    async def ingest_message(self, message) -> dict[str, int]:
+        """ライブの1発言をフック有無・内容に関係なくRAG記憶へ取り込む（問答無用）。"""
+        author = getattr(message, "author", None)
+        if author is None or getattr(author, "bot", False) or getattr(message, "webhook_id", None):
+            return {"scanned": 1, "imported": 0, "skipped": 1, "documents": 0}
+        text = str(getattr(message, "content", "") or "").strip()
+        if not text:
+            return {"scanned": 1, "imported": 0, "skipped": 1, "documents": 0}
+        timestamp = getattr(message, "created_at", None)
+        if timestamp is None:
+            raise UpstreamError("Discord履歴の日時")
+        return await self._memory.ingest_history_page(
+            int(message.guild.id),
+            int(message.channel.id),
+            [
+                {
+                    "id": str(message.id),
+                    "content": text,
+                    "timestamp": timestamp.isoformat(),
+                    "author": {"id": str(author.id)},
+                    "type": 0,
+                }
+            ],
+        )
+
     async def delete_memory(self, document_id: str) -> int:
         """文書単位で記憶から削除（忘れられる権利対応）。"""
         if not self._settings.memory.enabled:
