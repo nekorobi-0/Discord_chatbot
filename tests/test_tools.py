@@ -32,9 +32,9 @@ async def test_tavily_mock(settings, monkeypatch):
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
     hub = ToolHub(replace(settings.search, enabled=True, api_key="fake-key"))
     result = json.loads(await hub.execute("web_search", {"query": "alice@example.com を検索"}))
-    assert "alice@" not in str(calls)
+    assert "alice@example.com" in str(calls)
     assert len(result["untrusted_data"]) == 1
-    assert result["untrusted_data"][0]["content"] == "[EMAIL]"
+    assert result["untrusted_data"][0]["content"] == "alice@example.com"
 
 
 async def test_tavily_failure_and_invalid_arguments(settings, monkeypatch):

@@ -26,7 +26,7 @@ import numpy as np
 from sqlalchemy import delete
 from sqlmodel import Session, select
 
-from .config import ASRSettings, EmbeddingSettings, LLMSettings, MemorySettings, _is_internal_host, mask_pii
+from .config import ASRSettings, EmbeddingSettings, LLMSettings, MemorySettings, _is_internal_host
 from .db import (
     EmbeddingCacheRecord,
     HistoryCursorRecord,
@@ -225,14 +225,19 @@ class MemoryStore:
         response = await self._request(
             "POST",
             f"{self._embedding.base_url.rstrip('/')}/embeddings",
-            json={"model": self._embedding.model, "input": mask_pii(text)[0], "dimensions": self._embedding.dimension},
+            json={"model": self._embedding.model, "input": text, "dimensions": self._embedding.dimension},
             headers=headers,
         )
         if response.status_code == 429:
             raise RateLimitError()
         if response.status_code >= 400:
-            logger.warning("embedding http error", extra={"status": response.status_code})
-            raise UpstreamError("記憶のしくみ")
+            logger.warning(
+                "embedding http error: status=%s model=%s dimensions=%s",
+                response.status_code,
+                self._embedding.model,
+                self._embedding.dimension,
+            )
+            raise UpstreamError(f"Embedding HTTP {response.status_code} (model={self._embedding.model})")
         try:
             data = response.json()
         except ValueError as exc:
@@ -243,7 +248,10 @@ class MemoryStore:
         vector = [float(v) for v in items[0]["embedding"]]
         if len(vector) != self._embedding.dimension:
             logger.warning(
-                "embedding dimension mismatch", extra={"expected": self._embedding.dimension, "got": len(vector)}
+                "embedding dimension mismatch: expected=%s got=%s model=%s",
+                self._embedding.dimension,
+                len(vector),
+                self._embedding.model,
             )
             raise UpstreamError("記憶のしくみ")
         return vector
@@ -301,7 +309,7 @@ class MemoryStore:
             raise InvalidInputError("資料を読み取れなかったよ。") from exc
         if len(text) > self._memory.max_chars_per_document:
             raise InvalidInputError("資料が長すぎたよ。分割してほしいな。")
-        text = mask_pii(_sanitize_text(text))[0][: self._memory.max_chars_per_document]
+        text = _sanitize_text(text)[: self._memory.max_chars_per_document]
         if not text.strip():
             raise InvalidInputError("からっぽの資料だったよ。")
 
@@ -329,12 +337,11 @@ class MemoryStore:
             # 外部キー制約を満たすため、文書を先に確定させてからチャンクを書き込む。
             session.commit()
             for (chunk_id, piece), vector in zip(chunks, vectors, strict=True):
-                masked, _ = mask_pii(piece)
                 session.add(
                     MemoryChunkRecord(
                         chunk_id=chunk_id,
                         document_id=document_id,
-                        content=masked,
+                        content=piece,
                         embedding=_encode_vector(vector),
                         model=self._embedding.model,
                         dimension=self._embedding.dimension,
@@ -382,7 +389,7 @@ class MemoryStore:
             if author.get("bot") or message.get("webhook_id") or message.get("type", 0) not in {0, 19} or not text:
                 skipped.append(message_id)
                 continue
-            text = mask_pii(_sanitize_text(re.sub(r"<@!?[0-9]+>", "[メンバー]", text)))[0]
+            text = _sanitize_text(text)
             if not text:
                 skipped.append(message_id)
                 continue
@@ -392,7 +399,7 @@ class MemoryStore:
                     raise ValueError("timezone missing")
             except (KeyError, TypeError, ValueError):
                 raise UpstreamError("Discord履歴の日時") from None
-            member = hashlib.sha256(str(author.get("id", "unknown")).encode()).hexdigest()[:8]
+            member = str(author.get("id", "unknown"))
             line = f"[{timestamp.isoformat()}] member-{member}: {text}"
             if current and (
                 len(current) >= 20
@@ -485,7 +492,7 @@ class MemoryStore:
         """
         if not self._memory.enabled:
             return ()
-        text = mask_pii(_sanitize_text(query))[0]
+        text = _sanitize_text(query)
         if not text:
             return ()
         limit = min(int(top_k or self._memory.top_k), 24)

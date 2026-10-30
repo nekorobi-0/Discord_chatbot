@@ -26,10 +26,10 @@ async def test_ingest_search_restart_cache_delete(store, settings, monkeypatch):
     text = "連絡先 alice@example.com。プロジェクトの締切は金曜日です。"
     result = await store.ingest_document("plan.md", text.encode())
     assert len(result["document_id"]) == 32
-    assert all("alice@example.com" not in value for value in calls)
+    assert any("alice@example.com" in value for value in calls)
     hits = await store.search("プロジェクトの締切")
     assert "金曜日" in hits[0].text
-    assert "[EMAIL]" in hits[0].text
+    assert "alice@example.com" in hits[0].text
     assert result["document_id"] in hits[0].label
     before = len(calls)
     await store.search("プロジェクトの締切")
@@ -40,7 +40,7 @@ async def test_ingest_search_restart_cache_delete(store, settings, monkeypatch):
     assert len(calls) == before
     with Session(get_engine()) as db:
         doc = db.exec(select(MemoryDocumentRecord)).first()
-        assert "alice@example.com" not in doc.content and "[EMAIL]" in doc.content
+        assert "alice@example.com" in doc.content
         assert doc.title == "uploaded document"
     assert await restarted.delete_document(result["document_id"]) == result["chunks"]
     with Session(get_engine()) as db:
@@ -51,7 +51,7 @@ async def test_ingest_search_restart_cache_delete(store, settings, monkeypatch):
         await restarted.delete_document(result["document_id"])
 
 
-async def test_documents_masked_before_embedding(store, monkeypatch):
+async def test_documents_preserve_original_text_before_embedding(store, monkeypatch):
     captured = []
 
     async def embed(texts):
@@ -60,8 +60,8 @@ async def test_documents_masked_before_embedding(store, monkeypatch):
 
     monkeypatch.setattr(store, "embed", embed)
     result = await store.ingest_document("private.txt", b"api_key=topsecret alice@example.com")
-    assert "topsecret" not in json.dumps(captured)
-    assert "alice@" not in json.dumps(captured)
+    assert "topsecret" in json.dumps(captured)
+    assert "alice@example.com" in json.dumps(captured)
     assert result["chunks"] == 1
 
 
@@ -117,3 +117,16 @@ async def test_local_embedding_without_key(store, settings, monkeypatch):
     original = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
     assert await store.embed(["記憶する文章"]) == [[1.0] * 64]
+
+
+async def test_embedding_error_reports_status_and_model_without_response_body(store, monkeypatch, caplog):
+    async def request(method, url, **kwargs):
+        return httpx.Response(404, json={"error": "private echoed request alice@example.com"})
+
+    monkeypatch.setattr(store, "_request", request)
+    with pytest.raises(UpstreamError, match="Embedding HTTP 404"):
+        await store._embed_uncached("alice@example.com")
+    assert "status=404" in caplog.text
+    assert "model=embedding-test" in caplog.text
+    assert "dimensions=64" in caplog.text
+    assert "alice@example.com" not in caplog.text

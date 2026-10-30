@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from ..config import SearchSettings, mask_pii
+from ..config import SearchSettings
 from ..observability import metrics
 
 
@@ -45,7 +45,7 @@ class ToolHub:
                     "https://api.tavily.com/search",
                     headers={"Authorization": f"Bearer {self.search.api_key}"},
                     json={
-                        "query": mask_pii(query)[0],
+                        "query": query,
                         "max_results": self.search.max_results,
                         "include_raw_content": False,
                     },
@@ -59,9 +59,9 @@ class ToolHub:
                     continue
                 results.append(
                     {
-                        "title": mask_pii(str(item.get("title", ""))[:200])[0],
+                        "title": str(item.get("title", ""))[:200],
                         "url": url,
-                        "content": mask_pii(str(item.get("content", ""))[:1500])[0],
+                        "content": str(item.get("content", ""))[:1500],
                     }
                 )
             metrics.increment("ai_kun.web_searches_total")

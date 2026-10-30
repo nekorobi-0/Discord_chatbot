@@ -168,7 +168,11 @@ class AIKunClient(discord.Client):
         try:
             await self.service.ingest_message(message)
         except Exception as exc:  # 取り込み失敗を返信やログには出す。本文は出さない。
-            logger.warning("live history ingest failed: %s", type(exc).__name__)
+            logger.warning(
+                "live history ingest failed: %s (%s)",
+                type(exc).__name__,
+                exc.user_message() if isinstance(exc, AIKunError) else "詳細非表示",
+            )
 
         # 全自動バックフィル：観測したチャンネルの未保存分を、保存済みカーソルから
         # 古い順に巻き戻して即取り込みする（フック有無とは無関係・常時）。
@@ -183,7 +187,11 @@ class AIKunClient(discord.Client):
                     result["documents"],
                 )
         except Exception as exc:
-            logger.warning("auto backfill failed: %s", type(exc).__name__)
+            logger.warning(
+                "auto backfill failed: %s (%s)",
+                type(exc).__name__,
+                exc.user_message() if isinstance(exc, AIKunError) else "詳細非表示",
+            )
 
         content = message.content.strip()
         prefixes = (f"<@{self.user.id}>", f"<@!{self.user.id}>") if self.user else ()

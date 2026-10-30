@@ -3,7 +3,7 @@
 設計方針:
 - stateless な generate_reply() が唯一の応答経路（replay しても履歴は残らない）
 - 過去会話・ドキュメントは埋め込みインデックス経由でのみ参照する RAG
-- 個人情報らしい文字列は API 送信前にマスキング（検出には限界あり）
+- 会話・資料・応答の個人情報は自動マスクしない
 """
 
 from .chat import generate_reply

@@ -6,6 +6,10 @@ x-runtime: &runtime
     DATA_DIR: /app/data
     ASR_MODEL_PATH: /app/data/asr-model
     HTTP_HOST: 0.0.0.0
+    # 同梱の埋め込みサーバーに合わせる（旧.envのgemma2/3072を上書き）。
+    EMBEDDING_BASE_URL: http://127.0.0.1:11434/v1
+    EMBEDDING_MODEL: embeddinggemma-2
+    EMBEDDING_DIMENSION: "768"
   volumes:
     - bot-data:/app/data
   init: true

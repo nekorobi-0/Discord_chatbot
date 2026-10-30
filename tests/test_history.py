@@ -200,9 +200,9 @@ async def test_auto_backfill_is_idempotent(settings, embedded):
     assert second["scanned"] == 0 and second["imported"] == 0
 
 
-async def test_group_mask_deduplicate_and_citations(embedded):
+async def test_group_preserve_personal_information_deduplicate_and_citations(embedded):
     messages = [
-        message(1, "連絡先 alice@example.com"),
+        message(1, "連絡先 alice@example.com 090-1234-5678 <@123456789012345678>"),
         message(2),
         message(3, author={"bot": True}),
         message(4, "覚えないで"),
@@ -217,8 +217,8 @@ async def test_group_mask_deduplicate_and_citations(embedded):
         assert cursor.last_message_id == "6"
         assert len(db.exec(select(HistoryMessageRecord)).all()) == 6
         doc = db.exec(select(MemoryDocumentRecord)).one()
-        assert "alice@" not in doc.content and "[EMAIL]" in doc.content
-        assert "2026-10-30" in doc.content and "member-" in doc.content
+        assert "alice@example.com 090-1234-5678 <@123456789012345678>" in doc.content
+        assert "2026-10-30" in doc.content and "member-45678" in doc.content
         assert "覚えないで" in doc.content  # オプトアウト廃止：マーカーごと記録・索引される
         document_id = doc.document_id
     hits = await embedded.search("締切")

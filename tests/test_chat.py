@@ -25,8 +25,7 @@ async def test_reply_end_to_end_mock_api(settings, store, monkeypatch):
     service = ChatService(settings, store)
     result = await service.generate_reply("連絡先は alice@example.com です")
     assert result.content == "こんにちは！"
-    assert result.pii_masked_count == 1
-    assert "alice@example.com" not in str(sent)
+    assert "alice@example.com" in str(sent)
     assert len(sent[0]["messages"]) == 2
     await service.generate_reply("こんにちは")
     assert len(sent[1]["messages"]) == 2  # 履歴を追加しない
@@ -86,14 +85,14 @@ async def test_rag_context(settings, store, monkeypatch):
     assert reply.citations == (f"document:{result['document_id']}",)
 
 
-async def test_output_limit_and_masking(settings, store, monkeypatch):
+async def test_output_limit_preserves_personal_information(settings, store, monkeypatch):
     async def complete(*args, **kwargs):
         return ModelTurn(content="alice@example.com " + "あ" * 3000)
 
     monkeypatch.setattr(store, "complete_chat", complete)
     result = await ChatService(settings, store).generate_reply("こんにちは")
     assert len(result.content) <= settings.operational.max_output_chars
-    assert result.truncated and "alice@" not in result.content
+    assert result.truncated and "alice@example.com" in result.content
 
 
 @pytest.mark.parametrize("content", ["", " " * 4, "x" * 8001])
@@ -182,3 +181,40 @@ async def test_local_llm_without_key_and_without_budget(settings, store, monkeyp
         assert (await service.generate_reply("こんにちは")).content == "応答"
     assert len(calls) == 2
     assert not (Path(os.environ["DATA_DIR"]) / "budget.sqlite3").exists()
+
+
+async def test_backfill_coalesces_same_channel_and_serializes_others(settings, store, monkeypatch):
+    import asyncio
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = []
+    totals = {"scanned": 1, "imported": 1, "skipped": 0, "documents": 1}
+
+    async def backfill(settings, memory, channel_id, *, api=None):
+        calls.append(channel_id)
+        if channel_id == 34567:
+            entered.set()
+            await release.wait()
+        return dict(totals)
+
+    monkeypatch.setattr("ai_kun.history.backfill_channel", backfill)
+    service = ChatService(settings, store)
+    first = asyncio.create_task(service.backfill_channel(34567))
+    second = None
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        duplicate = await service.backfill_channel(34567)
+        assert duplicate == {"scanned": 0, "imported": 0, "skipped": 0, "documents": 0}
+        second = asyncio.create_task(service.backfill_channel(34568))
+        await asyncio.sleep(0)
+        assert calls == [34567]
+        release.set()
+        assert await first == totals
+        assert await second == totals
+        assert calls == [34567, 34568]
+        assert service._backfill_channels == set()
+    finally:
+        release.set()
+        await first
+        if second is not None:
+            await second

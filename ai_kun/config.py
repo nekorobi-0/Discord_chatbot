@@ -318,34 +318,3 @@ class Settings:
 def load_settings() -> Settings:
     """環境変数から設定を作る。失敗時はuser-safe なメッセージだけを返す。"""
     return Settings.from_env()
-
-
-def mask_pii(text: str) -> tuple[str, int]:
-    """LLM に渡す前に個人情報らしきものを伏せる。伏せた件数も返す。
-
-    完全に正確な PII 検出は不可能なので、怪しいものは必ず伏せておく、という多重防御。
-    """
-    masked = text or ""
-    count = 0
-
-    def _mask(pattern: re.Pattern[str], label: str) -> None:
-        nonlocal masked, count
-
-        def _sub(match: re.Match[str]) -> str:
-            nonlocal count
-            count += 1
-            return f"[{label}]"
-
-        masked = pattern.sub(_sub, masked)
-
-    # メール / 電話 / 住所らしきもの / 各種 ID / 鍵っぽい文字列
-    _mask(re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+"), "EMAIL")
-    _mask(re.compile(r"(?:\+?\d[\d\-() ]){9,15}"), "PHONE")
-    _mask(re.compile(r"(?:〒?\s*\d{3}-?\d{4})"), "POSTAL")
-    _mask(re.compile(r"\b(?:\d{1,4}[- ]?){3}\d{1,4}\b(?=\D*$)"), "NUMBER")
-    _mask(
-        re.compile(r"(?:api[_-]?key|secret|token|password|passwd|credential)\s*[:=]\s*\S+", re.IGNORECASE),
-        "SECRET",
-    )
-    _mask(re.compile(r"\bsk-[A-Za-z0-9_\-]{12,}\b"), "SECRET")
-    return masked, count
