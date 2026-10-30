@@ -26,7 +26,7 @@ import numpy as np
 from sqlalchemy import delete
 from sqlmodel import Session, select
 
-from .config import _INTERNAL_HOSTNAMES, ASRSettings, EmbeddingSettings, LLMSettings, MemorySettings, mask_pii
+from .config import ASRSettings, EmbeddingSettings, LLMSettings, MemorySettings, _is_internal_host, mask_pii
 from .db import (
     EmbeddingCacheRecord,
     HistoryCursorRecord,
@@ -107,16 +107,8 @@ class MemoryStore:
     # 検査を素通りして接続確立まで行われてしまう。HTTPS は従来どおり検証せず透過する。
     @staticmethod
     def _is_internal_ip(literal: str) -> bool:
-        """承認済みホスト名か、ゾーン指定のないループバック数値アドレスかを判定する。"""
-        if literal.strip("[]").lower() in _INTERNAL_HOSTNAMES:
-            return True
-        try:
-            address = ipaddress.ip_address(literal.strip("[]"))
-        except ValueError:
-            return False
-        if getattr(address, "scope_id", None) or getattr(address, "scope_zone", ""):
-            return False
-        return bool(address.is_loopback)
+        """設定検証と同じ宛先ポリシーで判定する。"""
+        return _is_internal_host(literal)
 
     async def _request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
         base = None

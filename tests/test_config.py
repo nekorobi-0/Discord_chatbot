@@ -43,6 +43,9 @@ def test_valid_base_urls(monkeypatch, url):
         "http://8.8.8.8:11434/v1",
         "http://169.253.0.1:11434/v1",
         "http://172.32.1.1:11434/v1",
+        "http://172.15.255.255:8080/v1",
+        "http://192.169.0.1:8080/v1",
+        "http://11.0.0.1:8080/v1",
         # 100.64.0.0/10 は共有アドレス域でプライベートではない。
         "http://100.64.0.9:11434/v1",
         "https:///v1",
@@ -87,14 +90,22 @@ def test_local_config_without_api_keys(monkeypatch):
 @pytest.mark.parametrize(
     "url",
     [
-        # 平文を認めるのはループバックだけ。承認済みホスト名も同じく許可する。
+        # ループバックとRFC1918への平文HTTPを許可する。
         "http://127.0.0.1:11434/v1",
         "http://[::1]:8080/v1",
         "http://localhost:11434/v1",
         "http://ip6-loopback:11434/v1",
+        "http://192.168.0.123:8080/v1",
+        "http://10.0.0.1:8080/v1",
+        "http://10.255.255.254:8080/v1",
+        "http://172.16.0.1:8080/v1",
+        "http://172.31.255.254:8080/v1",
+        "http://192.168.255.254:8080/v1",
+        "http://172.17.0.2:11434/v1",
+        "http://192.168.65.5:11434/v1",
     ],
 )
-def test_plaintext_to_loopback_is_allowed(url):
+def test_plaintext_to_internal_host_is_allowed(url):
     monkeypatch = pytest.MonkeyPatch()
     try:
         monkeypatch.setenv("LLM_BASE_URL", url)
@@ -113,18 +124,16 @@ def test_plaintext_to_loopback_is_allowed(url):
         "http://203.0.113.9:11434/v1",
         "http://169.253.0.1:11434/v1",
         "http://172.32.1.1:11434/v1",
-        # RFC1918・リンクローカル・CGNAT・一意ローカルIPv6 は平文の送信先にならない。
-        "http://10.0.0.5:11434/v1",
-        "http://172.16.4.20:8000/v1",
-        "http://192.168.1.50:11434/v1",
+        "http://172.15.255.255:8080/v1",
+        "http://192.169.0.1:8080/v1",
+        "http://11.0.0.1:8080/v1",
+        # リンクローカル・CGNAT・一意ローカルIPv6は許可対象外。
         "http://169.254.169.254:11434/v1",
         "http://100.64.0.9:11434/v1",
         "http://[fd12:3456::7]:8080/v1",
         "http://[fe80::2]:11434/v1",
-        # Docker ブリッジやゲートウェイも平文では拒否（loopback 経由だけを認める）。
+        # 未承認のホスト名は拒否する。
         "http://host.docker.internal:11434/v1",
-        "http://172.17.0.2:11434/v1",
-        "http://192.168.65.5:11434/v1",
         # 試験用・予約済み・6to4・IPv4 変換範囲は is_private が True でも社内扱いしない。
         "http://192.0.2.5:11434/v1",
         "http://198.51.100.9:11434/v1",
@@ -235,7 +244,16 @@ async def test_plaintext_request_to_non_internal_literal_is_blocked(settings, st
         await guarded.complete_chat([{"role": "user", "content": "こんにちは"}])
 
 
-async def test_plaintext_request_to_internal_literal_is_not_rewritten(settings, store, monkeypatch):
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://127.0.0.1:11434/v1",
+        "http://192.168.0.123:8080/v1",
+        "http://10.0.0.5:11434/v1",
+        "http://172.16.4.20:8000/v1",
+    ],
+)
+async def test_plaintext_request_to_internal_literal_is_not_rewritten(settings, store, monkeypatch, base_url):
     # 承認済み範囲への平文要求はそのまま透過し、設定値がそのまま使われることを確認する。
     import httpx
 
@@ -249,9 +267,9 @@ async def test_plaintext_request_to_internal_literal_is_not_rewritten(settings, 
 
     monkeypatch.setattr(httpx.AsyncClient, "request", handler)
     guarded = MemoryStore(settings.embedding, settings.llm, settings.asr, settings.memory)
-    guarded._llm = replace(settings.llm, base_url="http://127.0.0.1:11434/v1", api_key="")
+    guarded._llm = replace(settings.llm, base_url=base_url, api_key="")
     turn = await guarded.complete_chat([{"role": "user", "content": "こんにちは"}])
-    assert seen == ["http://127.0.0.1:11434/v1/chat/completions"]
+    assert seen == [f"{base_url}/chat/completions"]
     assert turn.content == "うん"
 
 
@@ -274,13 +292,10 @@ async def test_guard_runs_before_any_socket_is_opened(settings, store, monkeypat
 @pytest.mark.parametrize(
     "url",
     [
-        # 以前は承認範囲と誤判定していたが、ループバック限定へ切り替えたことで拒否対象になった。
-        # 特に CGNAT（100.64.0.0/10）とリンクローカルは公開中継インフラであり、平文の送信先にならない。
+        # CGNATとリンクローカルはRFC1918ではないため拒否する。
         "http://100.64.0.1:443/v1",
         "http://100.127.255.255:443/v1",
         "http://169.254.169.254:443/v1",
-        "http://172.17.0.2:11434/v1",
-        "http://192.168.65.5:11434/v1",
     ],
 )
 async def test_plaintext_request_to_public_relay_ranges_is_blocked(settings, store, monkeypatch, url):

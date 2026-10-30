@@ -83,20 +83,13 @@ def _float(name: str, default: float, minimum: float, maximum: float) -> float:
     return value
 
 
-# 平文 HTTP を認める宛先は、ループバックだけにする。
-#
-# 以前は RFC1918・リンクローカル・CGNAT（100.64.0.0/10）も承認していたが、この環境には名前解決が
-# 一切無い（systemd-resolved の 127.0.0.53 が上書きされ、検索ドメインも無い）。そのためホスト名を
-# 指定した設定は解決不能なまま拒否されるだけで、平文送信の抑止にまったく寄与しない。一方で承認範囲は
-# 検証されないまま残るため、`http://100.64.0.1` のような「名前を持たない中継先」への平文要求が
-# 検査を素通りし、接続確立まで行われていた（実測で 90 秒間の接続試行）。CGNAT・リンクローカルは
-# キャリアやクラウドの中継インフラが世界規模で割り当てており、公開インターネットの一部である。
-# よって承認対象をループバックに限定し、それ以外への平文要求は設定時点で拒否する。HTTPS は検証不要。
+# 平文HTTPはループバックとRFC1918のプライベートIPv4アドレスに許可する。
+_RFC1918_NETWORKS = tuple(ipaddress.ip_network(cidr) for cidr in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
 _INTERNAL_HOSTNAMES = frozenset({"localhost", "localhost.localdomain", "ip6-loopback"})
 
 
 def _is_internal_host(host: str) -> bool:
-    """ループバックとして承認済みかどうかを判定する。この環境では名前解決を使わない。"""
+    """ループバックまたはRFC1918かを、名前解決せずに判定する。"""
     candidate = host.strip("[]").lower()
     if "%" in candidate:  # ゾーン指定付き（fe80::1%eth0 など）は結線に使えないため承認しない
         return False
@@ -106,7 +99,7 @@ def _is_internal_host(host: str) -> bool:
         address = ipaddress.ip_address(candidate)
     except ValueError:
         return False  # 名前解決が使えない環境では、未知のホスト名は平文の送信先にならない
-    return bool(address.is_loopback)
+    return address.is_loopback or any(address in network for network in _RFC1918_NETWORKS)
 
 
 def _https_base_url(name: str, default: str = "") -> str:
