@@ -13,7 +13,7 @@ def test_example_can_be_configured(monkeypatch):
     settings = Settings.from_env()
     assert settings.llm.base_url == "http://127.0.0.1:11434/v1"
     assert settings.embedding.base_url == settings.llm.base_url
-    assert settings.discord.is_allowed_channel(0)
+    assert settings.discord.guild_id == 000000000000000000
 
 
 @pytest.mark.parametrize(

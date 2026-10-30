@@ -236,6 +236,8 @@ class FakeAPI:
     async def get(self, channel_id, *, messages=False, after=0):
         self.calls.append((channel_id, messages, after))
         if not messages:
+            if str(channel_id).startswith("guilds/"):
+                return [{"id": "34567", "type": 0, "guild_id": str(self.guild)}]
             return {"guild_id": str(self.guild), "type": 0}
         return [message(i) for i in reversed(range(after + 1, min(after + 100, 203) + 1))]
 
@@ -261,7 +263,7 @@ async def test_all_skipped_page_still_advances(settings, embedded):
             return [message(1, author={"bot": True})] if after == 0 else []
 
     result = await import_history(settings, embedded, api=BotsOnly(), until_id=100)
-    assert result["imported"] == 0 and result["skipped"] == 1
+    assert result["imported"] == 0 and result["scanned"] == 1 and result["skipped"] == 1
     with Session(get_engine()) as db:
         assert db.get(HistoryCursorRecord, "23456:34567").last_message_id == "1"
 
@@ -270,7 +272,8 @@ async def test_wrong_guild_never_fetches_messages(settings, embedded):
     api = FakeAPI(guild=99999)
     with pytest.raises(ConfigurationError, match="GUILD_ID"):
         await import_history(settings, embedded, api=api)
-    assert len(api.calls) == 1
+    # 一覧取得1回だけで、メッセージ取得へは進まない。
+    assert [messages for _, messages, _ in api.calls] == [False]
 
 
 async def test_memory_disabled_rejected(settings, embedded):

@@ -83,23 +83,6 @@ def _float(name: str, default: float, minimum: float, maximum: float) -> float:
     return value
 
 
-def _snowflake_list(name: str) -> tuple[int, ...]:
-    raw = _raw(name)
-    if not raw:
-        return ()
-    items: list[int] = []
-    for chunk in re.split(r"[,\s]+", raw):
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-        if not _SNOWFLAKE_RE.fullmatch(chunk):
-            raise ConfigurationError(f"{name} は数字（Snowflake ID）だけを書いてほしいな。")
-        items.append(int(chunk))
-    if len(items) > _MAX_LIST_ITEMS:
-        raise ConfigurationError(f"{name} が多すぎるよ。{_MAX_LIST_ITEMS} 件までにしてくれる？")
-    return tuple(dict.fromkeys(items))
-
-
 def _https_base_url(name: str, default: str = "") -> str:
     raw = _raw(name) or default
     if not raw:
@@ -146,7 +129,6 @@ class DiscordSettings:
     bot_token: str = field(repr=False, default="")
     application_id: int = 0
     guild_id: int = 0
-    allowed_channel_ids: tuple[int, ...] = ()
 
     @classmethod
     def from_env(cls) -> DiscordSettings:
@@ -157,18 +139,11 @@ class DiscordSettings:
             raise ConfigurationError("DISCORD_APPLICATION_ID が設定されてないみたい。数字だけで教えてくれる？")
         if not _SNOWFLAKE_RE.fullmatch(guild_raw):
             raise ConfigurationError("GUILD_ID が設定されてないみたい。数字だけで教えてくれる？")
-        channels = _snowflake_list("ALLOWED_CHANNEL_IDS")
-        if not channels:
-            raise ConfigurationError("ALLOWED_CHANNEL_IDS が空っぽだよ。返事してよいチャンネルを教えてほしいな。")
         return cls(
             bot_token=token,
             application_id=int(app_raw),
             guild_id=int(guild_raw),
-            allowed_channel_ids=channels,
         )
-
-    def is_allowed_channel(self, channel_id: int) -> bool:
-        return channel_id in self.allowed_channel_ids
 
 
 @dataclass(frozen=True)

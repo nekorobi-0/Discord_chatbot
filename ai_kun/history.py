@@ -119,9 +119,15 @@ class DiscordHistoryAPI:
         self.token = token
         self.limiter = limiter or HalfRateLimiter()
 
-    async def get(self, channel_id: int, *, messages=False, after=0):
-        route = "messages" if messages else "channel"
-        path = f"/channels/{channel_id}" + ("/messages" if messages else "")
+    async def get(self, resource, *, messages=False, after=0):
+        """チャンネルIDまたはDiscord APIパス（例: guilds/<id>/channels）へのGET。"""
+        route = "messages" if messages else "resource"
+        channel_id = resource
+        path = (
+            f"/channels/{channel_id}/messages"
+            if messages
+            else (f"/channels/{channel_id}" if str(resource).isdigit() else f"/{resource}")
+        )
         major = str(channel_id)
         for attempt in range(5):
             await self.limiter.wait(route, major)
@@ -176,10 +182,21 @@ async def import_history(settings, store, *, api=None, until_id=None) -> dict[st
     with importer_lock():
         async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
             api = api or DiscordHistoryAPI(settings.discord.bot_token, client)
-            for channel_id in settings.discord.allowed_channel_ids:
+            channels = await api.get(f"guilds/{settings.discord.guild_id}/channels")
+            entries = channels if isinstance(channels, list) else channels.get("data", [])
+            channel_ids = sorted(
+                int(entry["id"])
+                for entry in entries
+                if entry.get("type") in {0, 5} and str(entry.get("guild_id")) == str(settings.discord.guild_id)
+            )
+            if not channel_ids:
+                raise ConfigurationError(
+                    "GUILD_ID のサーバーでテキストチャンネルが見つからなかったよ。Botのチャンネル閲覧権限とサーバーIDを確認してほしいな。"
+                )
+            for channel_id in channel_ids:
                 channel = await api.get(channel_id)
                 if str(channel.get("guild_id")) != str(settings.discord.guild_id):
-                    raise ConfigurationError("許可チャンネルのサーバーIDがGUILD_IDと一致しません。")
+                    raise ConfigurationError("チャンネルのサーバーIDがGUILD_IDと一致しません。")
                 if channel.get("type") not in {0, 5, 10, 11, 12}:
                     raise ConfigurationError("履歴取り込みはテキストチャンネル・個別スレッドのみ対応しています。")
                 key = f"{settings.discord.guild_id}:{channel_id}"

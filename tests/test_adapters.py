@@ -11,12 +11,11 @@ from ai_kun.chat import ChatService
 from ai_kun.http_server import create_app
 
 
-def test_channel_and_guild_filter(settings):
-    assert allowed(settings, 23456, 34567)
-    assert not allowed(settings, 23456, 45678)
-    assert not allowed(settings, 99999, 34567)
-    assert not allowed(settings, None, 34567)
-    assert not allowed(settings, 23456, None)
+def test_guild_filter(settings):
+    # チャンネル単位の絞り込みは廃止済み。サーバー一致だけを確認する。
+    assert allowed(settings, 23456)
+    assert not allowed(settings, 99999)
+    assert not allowed(settings, None)
 
 
 def test_emoji_split():
@@ -46,7 +45,6 @@ async def test_commands_registered_and_disallowed_interaction(settings, store):
     [
         (True, 23456, 34567, "!ai hello"),
         (False, 99999, 34567, "!ai hello"),
-        (False, 23456, 45678, "!ai hello"),
         (False, None, 34567, "!ai hello"),
         (False, 23456, 34567, "普通の会話"),
     ],

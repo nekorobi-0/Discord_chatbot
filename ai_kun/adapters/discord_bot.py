@@ -16,8 +16,9 @@ logger = logging.getLogger(__name__)
 MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
 
 
-def allowed(settings: Settings, guild_id: int | None, channel_id: int | None) -> bool:
-    return guild_id == settings.discord.guild_id and channel_id in settings.discord.allowed_channel_ids
+def allowed(settings: Settings, guild_id: int | None) -> bool:
+    """チャンネル単位の絞り込みは廃止。設定したサーバー（GUILD_ID）内なら全チャンネル対象。"""
+    return guild_id is not None and guild_id == settings.discord.guild_id
 
 
 def split_message(text: str) -> list[str]:
@@ -37,7 +38,7 @@ def split_message(text: str) -> list[str]:
 
 class RestrictedTree(app_commands.CommandTree):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if not allowed(self.client.settings, interaction.guild_id, interaction.channel_id):
+        if not allowed(self.client.settings, interaction.guild_id):
             await interaction.response.send_message("このチャンネルでは利用できません。", ephemeral=True)
             return False
         return True
@@ -159,9 +160,7 @@ class AIKunClient(discord.Client):
             await self._answer(interaction, operation, ephemeral=True)
 
     async def on_message(self, message: discord.Message) -> None:
-        if message.author.bot or not allowed(
-            self.settings, message.guild.id if message.guild else None, message.channel.id
-        ):
+        if message.author.bot or not allowed(self.settings, message.guild.id if message.guild else None):
             return
         content = message.content.strip()
         prefixes = (f"<@{self.user.id}>", f"<@!{self.user.id}>") if self.user else ()

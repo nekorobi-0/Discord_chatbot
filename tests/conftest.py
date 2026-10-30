@@ -26,7 +26,7 @@ def isolated_data(tmp_path, monkeypatch):
 @pytest.fixture
 def settings():
     return Settings(
-        discord=DiscordSettings("test-token", 12345, 23456, (34567,)),
+        discord=DiscordSettings("test-token", 12345, 23456),
         llm=LLMSettings("https://llm.example/v1", "test-key", "test-model"),
         embedding=EmbeddingSettings("https://embed.example/v1", "test-key", "embedding-test", 64),
         asr=ASRSettings(),
