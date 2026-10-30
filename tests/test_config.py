@@ -14,8 +14,8 @@ def test_example_can_be_configured(monkeypatch):
     monkeypatch.setenv("DISCORD_BOT_TOKEN", "fake-discord")
     monkeypatch.setenv("LLM_API_KEY", "fake-llm")
     settings = Settings.from_env()
-    assert settings.llm.base_url == "http://127.0.0.1:11434/v1"
-    assert settings.embedding.base_url == settings.llm.base_url
+    assert settings.llm.base_url == "http://127.0.0.1:11435/v1"
+    assert settings.embedding.base_url == "http://127.0.0.1:11434/v1"
     assert settings.discord.guild_id == 000000000000000000
 
 
@@ -25,12 +25,6 @@ def test_example_can_be_configured(monkeypatch):
         "https://llm.example/v1",
         "http://localhost:11434/v1",
         "http://127.0.0.1:8000/v1",
-        "http://host.docker.internal:11434/v1",
-        # RFC 1918 プライベート範囲とローカル・予約済み範囲は HTTP を許す。
-        "http://10.0.0.5:11434/v1",
-        "http://172.16.4.20:8000/v1",
-        "http://192.168.1.50:11434/v1",
-        "http://169.254.169.254:11434/v1",
         "http://[::1]:8080/v1",
     ],
 )
@@ -93,19 +87,14 @@ def test_local_config_without_api_keys(monkeypatch):
 @pytest.mark.parametrize(
     "url",
     [
-        # RFC 1918・ループバック・リンクローカル・予約済み範囲への平文は許可する。
-        "http://10.0.0.5:11434/v1",
-        "http://172.16.4.20:8000/v1",
-        "http://192.168.1.50:11434/v1",
-        "http://169.254.169.254:11434/v1",
+        # 平文を認めるのはループバックだけ。承認済みホスト名も同じく許可する。
         "http://127.0.0.1:11434/v1",
         "http://[::1]:8080/v1",
-        "http://100.64.0.9:11434/v1",
-        "http://[fd12:3456::7]:8080/v1",
-        "http://[fe80::2]:11434/v1",
+        "http://localhost:11434/v1",
+        "http://ip6-loopback:11434/v1",
     ],
 )
-def test_plaintext_to_internal_ranges_is_allowed(url):
+def test_plaintext_to_loopback_is_allowed(url):
     monkeypatch = pytest.MonkeyPatch()
     try:
         monkeypatch.setenv("LLM_BASE_URL", url)
@@ -124,6 +113,18 @@ def test_plaintext_to_internal_ranges_is_allowed(url):
         "http://203.0.113.9:11434/v1",
         "http://169.253.0.1:11434/v1",
         "http://172.32.1.1:11434/v1",
+        # RFC1918・リンクローカル・CGNAT・一意ローカルIPv6 は平文の送信先にならない。
+        "http://10.0.0.5:11434/v1",
+        "http://172.16.4.20:8000/v1",
+        "http://192.168.1.50:11434/v1",
+        "http://169.254.169.254:11434/v1",
+        "http://100.64.0.9:11434/v1",
+        "http://[fd12:3456::7]:8080/v1",
+        "http://[fe80::2]:11434/v1",
+        # Docker ブリッジやゲートウェイも平文では拒否（loopback 経由だけを認める）。
+        "http://host.docker.internal:11434/v1",
+        "http://172.17.0.2:11434/v1",
+        "http://192.168.65.5:11434/v1",
         # 試験用・予約済み・6to4・IPv4 変換範囲は is_private が True でも社内扱いしない。
         "http://192.0.2.5:11434/v1",
         "http://198.51.100.9:11434/v1",
@@ -248,9 +249,9 @@ async def test_plaintext_request_to_internal_literal_is_not_rewritten(settings, 
 
     monkeypatch.setattr(httpx.AsyncClient, "request", handler)
     guarded = MemoryStore(settings.embedding, settings.llm, settings.asr, settings.memory)
-    guarded._llm = replace(settings.llm, base_url="http://10.0.0.5:11434/v1", api_key="")
+    guarded._llm = replace(settings.llm, base_url="http://127.0.0.1:11434/v1", api_key="")
     turn = await guarded.complete_chat([{"role": "user", "content": "こんにちは"}])
-    assert seen == ["http://10.0.0.5:11434/v1/chat/completions"]
+    assert seen == ["http://127.0.0.1:11434/v1/chat/completions"]
     assert turn.content == "うん"
 
 
@@ -268,3 +269,43 @@ async def test_guard_runs_before_any_socket_is_opened(settings, store, monkeypat
     guarded._llm = _replace(settings.llm, base_url="http://203.0.113.9:11434/v1", api_key="")
     with pytest.raises(UpstreamError):
         await guarded.complete_chat([{"role": "user", "content": "こんにちは"}])
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # 以前は承認範囲と誤判定していたが、ループバック限定へ切り替えたことで拒否対象になった。
+        # 特に CGNAT（100.64.0.0/10）とリンクローカルは公開中継インフラであり、平文の送信先にならない。
+        "http://100.64.0.1:443/v1",
+        "http://100.127.255.255:443/v1",
+        "http://169.254.169.254:443/v1",
+        "http://172.17.0.2:11434/v1",
+        "http://192.168.65.5:11434/v1",
+    ],
+)
+async def test_plaintext_request_to_public_relay_ranges_is_blocked(settings, store, monkeypatch, url):
+    from dataclasses import replace as _replace
+
+    from ai_kun.memory import MemoryStore
+
+    async def fail_if_called(self, method, target, **kwargs):
+        raise AssertionError(f"request escaped the guard: {target}")
+
+    monkeypatch.setattr(httpx.AsyncClient, "request", fail_if_called)
+    guarded = MemoryStore(settings.embedding, settings.llm, settings.asr, settings.memory)
+    guarded._llm = _replace(settings.llm, base_url=url, api_key="")
+    with pytest.raises(UpstreamError):
+        await guarded.complete_chat([{"role": "user", "content": "こんにちは"}])
+
+
+def test_loopback_hostnames_are_accepted_without_resolution():
+    # 承認済みホスト名は数値表記でなくてもよい。判定は名前解決を使わない。
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        for host in ("localhost", "localhost.localdomain", "ip6-loopback"):
+            monkeypatch.setenv("LLM_BASE_URL", f"http://{host}:11434/v1")
+            monkeypatch.setenv("LLM_API_KEY", "fake-key")
+            monkeypatch.setenv("LLM_MODEL", "model")
+            assert LLMSettings.from_env().base_url == f"http://{host}:11434/v1"
+    finally:
+        monkeypatch.undo()

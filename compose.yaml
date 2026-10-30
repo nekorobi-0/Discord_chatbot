@@ -17,5 +17,40 @@ services:
     <<: *runtime
     restart: unless-stopped
 
+  # 埋め込み推論。Embedding はこのサービスへしか行かないよう、bot の設定でループバックを指す。
+  # CPU 専用（GPU 不使用）。既定モデルは gemma2 / EMBEDDING_DIMENSION=3072 のまま変更しない。
+  embedding:
+    # 同一イメージを使う。GPU デバイス（/dev/kfd・/dev/dri）を受け渡さないため、このサービスは
+    # CPU でだけ推論する。レジストリに CPU 専用タグが無いのは確認済み（0.34.0-cpu は取得不能）。
+    image: ollama/ollama:0.34.0-rocm
+    container_name: ai-kun-embedding
+    environment:
+      OLLAMA_HOST: "127.0.0.1:11434"
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_FLASH_ATTENTION: "0"
+    volumes:
+      - embedding-models:/root/.ollama
+    ports:
+      # bot と同じループバックにのみ公開。LAN や Docker ブリッジには一切出さない。
+      - "127.0.0.1:11434:11434"
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    shm_size: 256m
+    deploy:
+      resources:
+        limits:
+          cpus: "8.0"
+          memory: 16g
+          pids: 512
+    restart: unless-stopped
+    stop_grace_period: 30s
+
 volumes:
   bot-data:
+  embedding-models:

@@ -26,7 +26,7 @@ import numpy as np
 from sqlalchemy import delete
 from sqlmodel import Session, select
 
-from .config import ASRSettings, EmbeddingSettings, LLMSettings, MemorySettings, mask_pii
+from .config import _INTERNAL_HOSTNAMES, ASRSettings, EmbeddingSettings, LLMSettings, MemorySettings, mask_pii
 from .db import (
     EmbeddingCacheRecord,
     HistoryCursorRecord,
@@ -102,40 +102,21 @@ class MemoryStore:
         init_db()
 
     # ---------- HTTP（SSRF 対策つき）----------
-    # 平文 HTTP を認める先は、RFC で割り当てられた社内・ローカル範囲だけにする。
-    # ipaddress の is_private / is_reserved は試験用（TEST-NET）・予約済み・6to4 ・IPv4 変換範囲を
-    # 「社内」と判定してしまうため、ここでは承認対象を明示的な接頭語で列挙し、それ以外は全て拒否する。
-    _INTERNAL_V4_PREFIXES = tuple(
-        ipaddress.ip_network(prefix)
-        for prefix in (
-            "10.0.0.0/8",  # RFC1918 私用範囲
-            "172.16.0.0/12",  # RFC1918 私用範囲
-            "192.168.0.0/16",  # RFC1918 私用範囲
-            "127.0.0.0/8",  # ループバック
-            "169.254.0.0/16",  # リンクローカル
-            "100.64.0.0/10",  # キャリアグレード NAT（社内中継で使うため承認）
-        )
-    )
-    _INTERNAL_V6_PREFIXES = tuple(
-        ipaddress.ip_network(prefix)
-        for prefix in (
-            "::1/128",  # ループバック
-            "fc00::/7",  # 一意ローカルアドレス（社内 IPv6）
-            "fe80::/10",  # リンクローカル
-        )
-    )
-
-    @classmethod
-    def _is_internal_ip(cls, literal: str) -> bool:
-        """ゾーン指定のない数値アドレスが、承認済みの社内・ローカル範囲に属するかを判定する。"""
+    # 平文 HTTP を認めるのはループバックだけ。承認範囲を広げると、この環境のように名前解決が無い
+    # host では `http://100.64.0.1` のような公開中継インフラ（CGNAT）やリンクローカルへの平文要求が
+    # 検査を素通りして接続確立まで行われてしまう。HTTPS は従来どおり検証せず透過する。
+    @staticmethod
+    def _is_internal_ip(literal: str) -> bool:
+        """承認済みホスト名か、ゾーン指定のないループバック数値アドレスかを判定する。"""
+        if literal.strip("[]").lower() in _INTERNAL_HOSTNAMES:
+            return True
         try:
             address = ipaddress.ip_address(literal.strip("[]"))
         except ValueError:
             return False
         if getattr(address, "scope_id", None) or getattr(address, "scope_zone", ""):
             return False
-        prefixes = cls._INTERNAL_V4_PREFIXES if address.version == 4 else cls._INTERNAL_V6_PREFIXES
-        return any(address in prefix for prefix in prefixes)
+        return bool(address.is_loopback)
 
     async def _request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
         base = None

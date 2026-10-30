@@ -83,44 +83,30 @@ def _float(name: str, default: float, minimum: float, maximum: float) -> float:
     return value
 
 
-# 平文 HTTP を認める宛先は、RFC で割り当てられた社内・ローカル範囲だけに限定する。
-# ipaddress の is_private / is_reserved は試験用（TEST-NET: 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24）、
-# 予約済み（240.0.0.0/4）・6to4・IPv4 変換範囲を「社内」と誤判定するため、承認対象を明示的な接頭語で列挙する。
-_INTERNAL_V4_PREFIXES = tuple(
-    ipaddress.ip_network(prefix)
-    for prefix in (
-        "10.0.0.0/8",  # RFC1918 私用範囲
-        "172.16.0.0/12",  # RFC1918 私用範囲
-        "192.168.0.0/16",  # RFC1918 私用範囲
-        "127.0.0.0/8",  # ループバック
-        "169.254.0.0/16",  # リンクローカル
-        "100.64.0.0/10",  # キャリアグレード NAT（社内中継で使うため承認）
-    )
-)
-_INTERNAL_V6_PREFIXES = tuple(
-    ipaddress.ip_network(prefix)
-    for prefix in (
-        "::1/128",  # ループバック
-        "fc00::/7",  # 一意ローカルアドレス（社内 IPv6）
-        "fe80::/10",  # リンクローカル
-    )
-)
-_INTERNAL_HOSTNAMES = frozenset({"localhost", "localhost.localdomain", "host.docker.internal", "ip6-loopback"})
+# 平文 HTTP を認める宛先は、ループバックだけにする。
+#
+# 以前は RFC1918・リンクローカル・CGNAT（100.64.0.0/10）も承認していたが、この環境には名前解決が
+# 一切無い（systemd-resolved の 127.0.0.53 が上書きされ、検索ドメインも無い）。そのためホスト名を
+# 指定した設定は解決不能なまま拒否されるだけで、平文送信の抑止にまったく寄与しない。一方で承認範囲は
+# 検証されないまま残るため、`http://100.64.0.1` のような「名前を持たない中継先」への平文要求が
+# 検査を素通りし、接続確立まで行われていた（実測で 90 秒間の接続試行）。CGNAT・リンクローカルは
+# キャリアやクラウドの中継インフラが世界規模で割り当てており、公開インターネットの一部である。
+# よって承認対象をループバックに限定し、それ以外への平文要求は設定時点で拒否する。HTTPS は検証不要。
+_INTERNAL_HOSTNAMES = frozenset({"localhost", "localhost.localdomain", "ip6-loopback"})
 
 
 def _is_internal_host(host: str) -> bool:
-    """社内・ローカル中継先として承認済みかどうかを判定する。名前解決は要求しない。"""
+    """ループバックとして承認済みかどうかを判定する。この環境では名前解決を使わない。"""
     candidate = host.strip("[]").lower()
-    if "%" in candidate:  # ゾーン指定付き（fe80::1%eth0 など）は承認対象外
+    if "%" in candidate:  # ゾーン指定付き（fe80::1%eth0 など）は結線に使えないため承認しない
         return False
-    if candidate in _INTERNAL_HOSTNAMES:
+    if candidate in _INTERNAL_HOSTNAMES:  # 承認済み名前は数値表記でなくてもよい
         return True
     try:
         address = ipaddress.ip_address(candidate)
     except ValueError:
-        return False
-    prefixes = _INTERNAL_V4_PREFIXES if address.version == 4 else _INTERNAL_V6_PREFIXES
-    return any(address in prefix for prefix in prefixes)
+        return False  # 名前解決が使えない環境では、未知のホスト名は平文の送信先にならない
+    return bool(address.is_loopback)
 
 
 def _https_base_url(name: str, default: str = "") -> str:
