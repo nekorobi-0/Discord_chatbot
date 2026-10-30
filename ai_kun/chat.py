@@ -123,6 +123,14 @@ class ChatService:
             ],
         )
 
+    async def backfill_channel(self, channel_id: int, *, api=None) -> dict[str, int]:
+        """フック有無に関係なく観測したチャンネルの未保存分を、自動で巻き戻し取り込みする。"""
+        if not self._settings.memory.enabled:
+            raise UpstreamError("記憶")
+        from .history import backfill_channel as _backfill
+
+        return await _backfill(self._settings, self._memory, int(channel_id), api=api)
+
     async def delete_memory(self, document_id: str) -> int:
         """文書単位で記憶から削除（忘れられる権利対応）。"""
         if not self._settings.memory.enabled:

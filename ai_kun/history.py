@@ -113,6 +113,10 @@ class HalfRateLimiter:
             self.global_next = max(self.global_next, deadline)
 
 
+# 稼働中Botの自動取り込み（バックフィル）もこの共通制限器を共有する。
+shared_limiter = HalfRateLimiter()
+
+
 class DiscordHistoryAPI:
     def __init__(self, token: str, client: httpx.AsyncClient, limiter=None):
         self.client = client
@@ -170,6 +174,47 @@ class DiscordHistoryAPI:
                 raise UpstreamError("Discord履歴取得")
             return data
         raise UpstreamError("Discord履歴取得（再試行上限）")
+
+
+async def backfill_channel(settings, store, channel_id: int, *, api=None) -> dict[str, int]:
+    """保存済みカーソルから未保存分だけを、稼働中のBot内で自動追跡する。
+
+    取り込み済みメッセージIDとタイムスタンプはDBに記録済みで、Discord APIの
+    ページング結果（フック有無に関係なく観測できる）と比較すれば欠落を判定できる。
+    共通レート制限器越しに古い順へ巻き戻し、欠落を即座にRAG記憶へ取り込む。
+    """
+    totals = {"scanned": 0, "imported": 0, "skipped": 0, "documents": 0}
+    key = f"{settings.discord.guild_id}:{channel_id}"
+    with Session(get_engine()) as session:
+        checkpoint = session.get(HistoryCursorRecord, key)
+        cursor = int(checkpoint.last_message_id) if checkpoint else 0
+    async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
+        api = api or DiscordHistoryAPI(settings.discord.bot_token, client, shared_limiter)
+        channel = await api.get(channel_id)
+        if str(channel.get("guild_id")) != str(settings.discord.guild_id):
+            raise ConfigurationError("チャンネルのサーバーIDがGUILD_IDと一致しません。")
+        while True:
+            page = await api.get(channel_id, messages=True, after=cursor)
+            try:
+                ordered = sorted(page, key=lambda message: int(message["id"]))
+                eligible = [m for m in ordered if cursor < int(m["id"])]
+            except (KeyError, TypeError, ValueError):
+                raise UpstreamError("Discord履歴の形式") from None
+            if not eligible:
+                break
+            result = await store.ingest_history_page(settings.discord.guild_id, channel_id, eligible)
+            cursor = int(eligible[-1]["id"])
+            for name in totals:
+                totals[name] += result[name]
+            logger.info(
+                "auto backfill progress channel=%s scanned=%d imported=%d skipped=%d documents=%d",
+                channel_id,
+                totals["scanned"],
+                totals["imported"],
+                totals["skipped"],
+                totals["documents"],
+            )
+    return totals
 
 
 async def import_history(settings, store, *, api=None, until_id=None) -> dict[str, int]:

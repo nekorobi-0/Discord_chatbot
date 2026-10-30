@@ -177,6 +177,29 @@ def embedded(store, monkeypatch):
     return store
 
 
+async def test_auto_backfill_fills_gaps_from_cursor(settings, embedded):
+    # 稼働中Botと同じ経路（backfill_channel）で、未保存分を古い順に自動補完する。
+    from ai_kun.chat import ChatService
+
+    service = ChatService(settings, embedded)
+    result = await service.backfill_channel(34567, api=FakeAPI())
+    assert result["imported"] == 203 and result["documents"] >= 1
+    with Session(get_engine()) as db:
+        cursor = db.get(HistoryCursorRecord, "23456:34567")
+        assert cursor is not None and int(cursor.last_message_id) >= 203
+
+
+async def test_auto_backfill_is_idempotent(settings, embedded):
+    from ai_kun.chat import ChatService
+
+    service = ChatService(settings, embedded)
+    first = await service.backfill_channel(34555, api=FakeAPI())
+    assert first["imported"] >= 1
+    second = await service.backfill_channel(34555, api=FakeAPI())
+    # カーソルより古い済みメッセージは再索引しない。
+    assert second["scanned"] == 0 and second["imported"] == 0
+
+
 async def test_group_mask_deduplicate_and_citations(embedded):
     messages = [
         message(1, "連絡先 alice@example.com"),
