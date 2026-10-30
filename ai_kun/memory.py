@@ -31,10 +31,14 @@ from .db import (
     HistoryMessageRecord,
     MemoryChunkRecord,
     MemoryDocumentRecord,
+    MetadataDocumentLinkRecord,
+    MetadataEnvelopeRecord,
     get_engine,
     init_db,
 )
 from .errors import ConfigurationError, InvalidInputError, RateLimitError, UpstreamError
+from .metadata import MetadataEnvelope, MetadataGrant, detect_flags
+from .observability import metrics
 
 logger = logging.getLogger("ai_kun.memory")
 
@@ -86,6 +90,7 @@ class MemoryStore:
         self._asr = asr
         self._memory = memory
         self._crypto = KeyProvider() if memory.enabled else None
+        self._envelope = MetadataEnvelope(self._crypto) if memory.enabled else None
         init_db()
         if self._crypto:
             with Session(get_engine()) as session:
@@ -311,6 +316,8 @@ class MemoryStore:
                 break
 
         vectors = await self.embed([piece for _, piece in chunks])
+        # 話者ID・チャンネルIDは使わないが、「どの文書か」を暗号化した目録を作り、検索時の照合に使う。
+        envelope_sealed = self._envelope.seal({"document_id": document_id, "flags": 0})
         with Session(get_engine()) as session:
             session.add(
                 MemoryDocumentRecord(
@@ -322,6 +329,12 @@ class MemoryStore:
                 )
             )
             session.flush()
+            # 目録封書の主キーは別枠のランダムID。文書との対応はリンク行だけで表す。
+            envelope_id = uuid.uuid4().hex
+            session.add(MetadataEnvelopeRecord(envelope_id=envelope_id, sealed=envelope_sealed))
+            # 封書行を先に確定させてからリンクを書く（挿入順序の違いで外部キーに引っ掛けない）。
+            session.flush()
+            session.add(MetadataDocumentLinkRecord(envelope_id=envelope_id, document_id=document_id))
             for (chunk_id, piece), vector in zip(chunks, vectors, strict=True):
                 masked, _ = mask_pii(piece)
                 session.add(
@@ -413,6 +426,20 @@ class MemoryStore:
 
         # Embedding失敗時にはここへ到達しないため、カーソルも進まず同じページから再開できる。
         now = datetime.now(UTC)
+        flags = detect_flags(messages)
+        authors = []
+        for message in messages:
+            author = str((message.get("author") or {}).get("id") or "")
+            if author and author not in authors:
+                authors.append(author)
+        payload = {
+            "guild_id": str(guild_id),
+            "channel_id": str(channel_id),
+            "authors": authors,
+            "flags": flags,
+        }
+        # 目録は1本の暗号化封書としてだけ保存する。話者ID・チャンネルIDは平文で行を作らない。
+        sealed_envelopes = [self._envelope.seal(payload) for _ in prepared]
         with Session(get_engine()) as session:
             for document_id, text, group, pieces, vectors in prepared:
                 session.add(
@@ -425,6 +452,13 @@ class MemoryStore:
                     )
                 )
             session.flush()
+            # 文書行を確定させたうえで、目録封書と対応付けを同じトランザクションに書く。
+            for sealed, (document_id, *_rest) in zip(sealed_envelopes, prepared, strict=True):
+                envelope_id = uuid.uuid4().hex
+                session.add(MetadataEnvelopeRecord(envelope_id=envelope_id, sealed=sealed))
+                # 封書行を先に確定させてからリンクを書く（挿入順序の違いで外部キーに引っ掛けない）。
+                session.flush()
+                session.add(MetadataDocumentLinkRecord(envelope_id=envelope_id, document_id=document_id))
             for document_id, text, group, pieces, vectors in prepared:
                 for piece, vector in zip(pieces, vectors, strict=True):
                     session.add(
@@ -467,9 +501,18 @@ class MemoryStore:
             "documents": len(groups),
         }
 
-    async def search(self, query: str, top_k: int | None = None) -> tuple[RetrievedChunk, ...]:
+    async def search(
+        self, query: str, grant: MetadataGrant, top_k: int | None = None
+    ) -> tuple[RetrievedChunk, ...]:
+        """埋め込み近傍検索。目録（話者ID・チャンネルID・添付種別）の条件を満たす項目だけ返す。
+
+        grant が空でも「条件なし」として全件対象になるだけ。目録がある項目は必ず
+        matches() を通らなければ結果から落とすため、絞り込み要求を無視して返さない。
+        """
         if not self._memory.enabled:
             return ()
+        if not isinstance(grant, MetadataGrant):
+            raise InvalidInputError("検索の絞り込み条件を読み取れなかったよ。もう一回おねがい。")
         text = mask_pii(_sanitize_text(query))[0]
         if not text:
             return ()
@@ -494,8 +537,25 @@ class MemoryStore:
             if not isinstance(vector, list) or len(vector) != self._embedding.dimension:
                 continue
             score = _cosine(query_vector, [float(v) for v in vector])
-            if score >= self._memory.min_score:
-                scored.append((score, row))
+            if score < self._memory.min_score:
+                continue
+            with Session(get_engine()) as session:
+                linked = session.exec(
+                    select(MetadataEnvelopeRecord)
+                    .join(MetadataDocumentLinkRecord, MetadataDocumentLinkRecord.envelope_id == MetadataEnvelopeRecord.envelope_id)
+                    .where(MetadataDocumentLinkRecord.document_id == row.document_id)
+                ).first()
+            if linked is not None:
+                # 目録がある項目は封書を検証して条件照合。読めない封書の項目は安全側で落とす。
+                try:
+                    payload = self._envelope.open(linked.sealed)
+                except Exception:
+                    logger.warning("stored memory index unreadable")
+                    continue
+                if not MetadataEnvelope.matches(payload, grant):
+                    metrics.increment("ai_kun.retrieval_filtered_out_total")
+                    continue
+            scored.append((score, row))
         scored.sort(key=lambda item: item[0], reverse=True)
         results: list[RetrievedChunk] = []
         for _, row in scored[:limit]:
@@ -517,6 +577,17 @@ class MemoryStore:
     async def delete_document(self, document_id: str) -> int:
         doc_id = str(document_id)[:64]
         with Session(get_engine()) as session:
+            # 先に目録封書と対応付けを消す（文書行より先に消さないと外部キーで削除自体が止まる）。
+            linked = session.exec(
+                select(MetadataDocumentLinkRecord).where(MetadataDocumentLinkRecord.document_id == doc_id)
+            ).all()
+            for row in linked:
+                session.delete(row)
+                session.flush()
+                envelope = session.get(MetadataEnvelopeRecord, row.envelope_id)
+                if envelope is not None:
+                    session.delete(envelope)
+            session.flush()
             chunks = (
                 session.exec(delete(MemoryChunkRecord).where(MemoryChunkRecord.document_id == doc_id)).rowcount or 0
             )

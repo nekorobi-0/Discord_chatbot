@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from .config import Settings, mask_pii
 from .errors import AIKunError, ConfigurationError, InvalidInputError, UpstreamError
 from .memory import MemoryStore
+from .metadata import MetadataEnvelope, MetadataGrant
 from .observability import AuditLog, metrics
 from .tools import ToolHub
 
@@ -107,6 +108,12 @@ class ChatService:
             raise UpstreamError("記憶")
         return await self._memory.delete_document(document_id)
 
+    async def search_memory(self, query: str, grant: MetadataGrant) -> tuple[RetrievedItem, ...]:
+        """管理者向け。話者ID・チャンネルID・添付種別で絞り込んだ検索。条件を満たす項目だけ返す。"""
+        if not self._settings.memory.enabled:
+            raise UpstreamError("記憶")
+        return await self._retrieve(query, grant)
+
     # ---------- 応答 ----------
     async def generate_reply(self, content: str) -> ChatResult:
         async with self._reply_lock:
@@ -137,7 +144,8 @@ class ChatService:
         if _is_memory_opt_out(masked):
             metrics.increment("ai_kun.memory_skipped_total")
         elif _needs_memory_lookup(masked):
-            items = await self._retrieve(masked)
+            # 明示的な絞り込み要求が無い限り「条件なし」として検索する。条件付き検索はスラッシュコマンド経由だけ。
+            items = await self._retrieve(masked, MetadataGrant())
             if items:
                 metrics.increment("ai_kun.memory_retrievals_total")
         messages = self._build_messages(masked, items)
@@ -174,11 +182,22 @@ class ChatService:
         )
 
     # ---------- 内部 ----------
-    async def _retrieve(self, query: str) -> tuple[RetrievedItem, ...]:
+    @staticmethod
+    def build_grant(**kwargs: object) -> MetadataGrant:
+        """利用者が指定した絞り込み条件（話者ID・チャンネルID・添付種別）を検索用の条件にする。"""
+        return MetadataGrant(
+            user_ids=MetadataEnvelope.normalize_user_ids(kwargs.get("user_ids")),
+            channel_ids=MetadataEnvelope.normalize_channel_ids(kwargs.get("channel_ids")),
+            require_image=bool(kwargs.get("has_image")),
+            require_video=bool(kwargs.get("has_video")),
+            require_other_file=bool(kwargs.get("has_other_file")),
+        )
+
+    async def _retrieve(self, query: str, grant: MetadataGrant) -> tuple[RetrievedItem, ...]:
         if not self._settings.memory.enabled:
             return ()
         try:
-            hits = await self._memory.search(query, top_k=self._settings.memory.top_k)
+            hits = await self._memory.search(query, grant, top_k=self._settings.memory.top_k)
         except AIKunError as exc:
             metrics.increment("ai_kun.retrieval_failures_total")
             logger.warning("retrieval degraded: %s", type(exc).__name__)

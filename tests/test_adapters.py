@@ -28,7 +28,13 @@ def test_emoji_split():
 
 async def test_commands_registered_and_disallowed_interaction(settings, store):
     client = AIKunClient(settings, ChatService(settings, store))
-    assert {cmd.name for cmd in client.tree.get_commands()} == {"ask", "remember", "ingest", "forget"}
+    assert {cmd.name for cmd in client.tree.get_commands()} == {
+        "ask",
+        "remember",
+        "ingest",
+        "forget",
+        "search_memory",
+    }
     interaction = SimpleNamespace(guild_id=99999, channel_id=34567, response=SimpleNamespace(send_message=AsyncMock()))
     assert not await client.tree.interaction_check(interaction)
     interaction.response.send_message.assert_awaited_once()

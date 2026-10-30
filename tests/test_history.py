@@ -7,6 +7,7 @@ from sqlmodel import Session, select
 from ai_kun.db import HistoryCursorRecord, HistoryMessageRecord, MemoryDocumentRecord, get_engine
 from ai_kun.errors import ConfigurationError, UpstreamError
 from ai_kun.history import DiscordHistoryAPI, HalfRateLimiter, import_history, importer_lock
+from ai_kun.metadata import MetadataGrant
 
 
 class Clock:
@@ -198,7 +199,7 @@ async def test_group_mask_deduplicate_and_citations(embedded):
         assert "2026-10-30" in text and "member-" in text
         assert "覚えないで" not in text
         document_id = doc.document_id
-    hits = await embedded.search("締切")
+    hits = await embedded.search("締切", MetadataGrant())
     assert "https://discord.com/channels/23456/34567/" in hits[0].label
     assert document_id in hits[0].label
     again = await embedded.ingest_history_page(23456, 34567, messages)
@@ -206,7 +207,7 @@ async def test_group_mask_deduplicate_and_citations(embedded):
     await embedded.delete_document(document_id)
     # 再走査しても削除したログが復活しない。
     assert (await embedded.ingest_history_page(23456, 34567, messages))["imported"] == 0
-    assert await embedded.search("締切") == ()
+    assert await embedded.search("締切", MetadataGrant()) == ()
 
 
 async def test_group_by_count_and_time_gap(embedded):

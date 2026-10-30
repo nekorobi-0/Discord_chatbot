@@ -6,9 +6,15 @@ import httpx
 import pytest
 from sqlmodel import Session, select
 
-from ai_kun.db import EmbeddingCacheRecord, MemoryChunkRecord, MemoryDocumentRecord, get_engine
+from ai_kun.db import (
+    EmbeddingCacheRecord,
+    MemoryChunkRecord,
+    MemoryDocumentRecord,
+    get_engine,
+)
 from ai_kun.errors import ConfigurationError, InvalidInputError, UpstreamError
 from ai_kun.memory import MemoryStore
+from ai_kun.metadata import MetadataGrant
 
 
 async def test_ingest_search_restart_cache_delete(store, settings, monkeypatch):
@@ -23,16 +29,16 @@ async def test_ingest_search_restart_cache_delete(store, settings, monkeypatch):
     result = await store.ingest_document("plan.md", text.encode())
     assert len(result["document_id"]) == 32
     assert all("alice@example.com" not in value for value in calls)
-    hits = await store.search("プロジェクトの締切")
+    hits = await store.search("プロジェクトの締切", MetadataGrant())
     assert "金曜日" in hits[0].text
     assert "[EMAIL]" in hits[0].text
     assert result["document_id"] in hits[0].label
     before = len(calls)
-    await store.search("プロジェクトの締切")
+    await store.search("プロジェクトの締切", MetadataGrant())
     assert len(calls) == before  # 永続キャッシュで再送しない
     restarted = MemoryStore(settings.embedding, settings.llm, settings.asr, settings.memory)
     monkeypatch.setattr(restarted, "_request", request)
-    assert (await restarted.search("プロジェクトの締切"))[0].text == hits[0].text
+    assert (await restarted.search("プロジェクトの締切", MetadataGrant()))[0].text == hits[0].text
     assert len(calls) == before
     with Session(get_engine()) as db:
         doc = db.exec(select(MemoryDocumentRecord)).first()
@@ -42,7 +48,7 @@ async def test_ingest_search_restart_cache_delete(store, settings, monkeypatch):
     with Session(get_engine()) as db:
         assert db.exec(select(MemoryChunkRecord)).all() == []
         assert db.exec(select(EmbeddingCacheRecord)).all() == []
-    assert await restarted.search("プロジェクトの締切") == ()
+    assert await restarted.search("プロジェクトの締切", MetadataGrant()) == ()
     with pytest.raises(InvalidInputError):
         await restarted.delete_document(result["document_id"])
 
@@ -96,7 +102,7 @@ async def test_model_change_excludes_old_vectors(store, settings, monkeypatch):
     await store.ingest_document("x.txt", b"old-model data")
     changed = MemoryStore(replace(settings.embedding, model="new-model"), settings.llm, settings.asr, settings.memory)
     monkeypatch.setattr(changed, "embed", embed)
-    assert await changed.search("data") == ()
+    assert await changed.search("data", MetadataGrant()) == ()
 
 
 async def test_low_similarity_is_not_retrieved(store, monkeypatch):
@@ -110,7 +116,7 @@ async def test_low_similarity_is_not_retrieved(store, monkeypatch):
         return [[0.0, 1.0] + [0.0] * 62 for text in texts]
 
     monkeypatch.setattr(store, "embed", other_embed)
-    assert await store.search("unrelated question") == ()
+    assert await store.search("unrelated question", MetadataGrant()) == ()
 
 
 async def test_local_embedding_without_key(store, settings, monkeypatch):
