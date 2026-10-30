@@ -11,4 +11,5 @@ FROM ghcr.io/ggml-org/llama.cpp:server@sha256:b32890309c1a33a534a01b0b461e953dc2
 COPY --from=download --chmod=0444 /models/embeddinggemma-2.gguf /models/embeddinggemma-2.gguf
 USER 10001:10001
 ENTRYPOINT ["/app/llama-server"]
-CMD ["--model", "/models/embeddinggemma-2.gguf", "--alias", "embeddinggemma-2", "--embeddings", "--host", "127.0.0.1", "--port", "11434", "--n-gpu-layers", "0", "--threads", "8", "--ctx-size", "8192"]
+# 非因果Embeddingでは1入力をubatch内に収める。512の既定値では日本語900文字がHTTP 500になる。
+CMD ["--model", "/models/embeddinggemma-2.gguf", "--alias", "embeddinggemma-2", "--embeddings", "--host", "127.0.0.1", "--port", "11434", "--n-gpu-layers", "0", "--threads", "8", "--ctx-size", "8192", "--batch-size", "8192", "--ubatch-size", "8192", "--parallel", "4"]

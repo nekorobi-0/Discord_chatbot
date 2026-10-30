@@ -130,3 +130,49 @@ async def test_embedding_error_reports_status_and_model_without_response_body(st
     assert "model=embedding-test" in caplog.text
     assert "dimensions=64" in caplog.text
     assert "alice@example.com" not in caplog.text
+
+
+async def test_embedding_batches_deduplicate_preserve_order_and_reuse_cache(store, monkeypatch):
+    calls = []
+
+    async def request(method, url, **kwargs):
+        data = kwargs["json"]["input"]
+        texts = [data] if isinstance(data, str) else data
+        calls.append(list(texts))
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"index": index, "embedding": [float(text.split("-")[1])] + [0.0] * 63}
+                    for index, text in reversed(list(enumerate(texts)))
+                ]
+            },
+        )
+
+    monkeypatch.setattr(store, "_request", request)
+    texts = [f"text-{index}" for index in range(20)] + ["text-3", "text-0"]
+    vectors = await store.embed(texts)
+    assert [vector[0] for vector in vectors] == list(range(20)) + [3, 0]
+    assert len(calls) == 2
+    assert sum(map(len, calls)) == 20
+    assert await store.embed(list(reversed(texts))) == list(reversed(vectors))
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"data": [{"index": 0, "embedding": [1.0] * 64}]},
+        {"data": [{"index": 0, "embedding": [1.0] * 64}, {"index": 0, "embedding": [1.0] * 64}]},
+        {"data": [{"index": 0, "embedding": [1.0] * 63}, {"index": 1, "embedding": [1.0] * 64}]},
+    ],
+)
+async def test_invalid_batch_embeddings_are_not_saved(store, monkeypatch, data):
+    async def request(method, url, **kwargs):
+        return httpx.Response(200, json=data)
+
+    monkeypatch.setattr(store, "_request", request)
+    with pytest.raises(UpstreamError):
+        await store.embed(["first", "second"])
+    with Session(get_engine()) as session:
+        assert session.exec(select(EmbeddingCacheRecord)).all() == []

@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from threading import Lock
 from uuid import uuid4
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlmodel import Session, select
 
 from .db import HistoryCursorRecord, HistoryMessageRecord, MemoryChunkRecord, MemoryDocumentRecord, get_engine
@@ -39,9 +39,14 @@ class IngestionMonitor:
     def finish(self, job_id: str, *, result=None, error: str | None = None):
         with self._lock:
             job = self._active.pop(job_id)
+            finished = datetime.now(UTC)
+            started = datetime.fromisoformat(job["started_at"] or job["accepted_at"])
+            accepted = datetime.fromisoformat(job["accepted_at"])
             job.update(
                 status="failed" if error else "completed",
-                finished_at=datetime.now(UTC).isoformat(),
+                finished_at=finished.isoformat(),
+                elapsed_seconds=round((finished - started).total_seconds(), 3),
+                queued_seconds=round((started - accepted).total_seconds(), 3),
                 result=dict(result or {}),
                 error=error,
             )
@@ -65,6 +70,9 @@ def stored_status(guild_id: int, model: str, dimension: int) -> dict:
     chunk = MemoryChunkRecord
     guild = str(guild_id)
     document_ids = select(history.document_id).where(history.guild_id == guild, history.document_id.is_not(None))
+    included_documents = select(MemoryDocumentRecord.document_id).where(
+        or_(MemoryDocumentRecord.source == "upload", MemoryDocumentRecord.document_id.in_(document_ids))
+    )
     searchable = (
         select(chunk.document_id)
         .join(MemoryDocumentRecord, MemoryDocumentRecord.document_id == chunk.document_id)
@@ -89,12 +97,12 @@ def stored_status(guild_id: int, model: str, dimension: int) -> dict:
         documents = session.exec(
             select(func.count())
             .select_from(MemoryDocumentRecord)
-            .where(MemoryDocumentRecord.document_id.in_(document_ids))
+            .where(MemoryDocumentRecord.document_id.in_(included_documents))
         ).one()
         chunks = session.exec(
             select(func.count())
             .select_from(chunk)
-            .where(chunk.document_id.in_(document_ids), chunk.model == model, chunk.dimension == dimension)
+            .where(chunk.document_id.in_(included_documents), chunk.model == model, chunk.dimension == dimension)
         ).one()
     channels = [
         {"channel_id": channel, "processed": processed, "searchable": ready, "last_message_id": cursors.get(channel)}

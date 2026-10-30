@@ -7,10 +7,13 @@ from collections.abc import Awaitable, Callable
 import discord
 from discord import app_commands
 
-from ..chat import ChatService
+from ..chat import ChatService, RetrievedItem
 from ..config import Settings
 from ..errors import AIKunError, InvalidInputError
+from ..images import IMAGE_EXTENSIONS, image_data_url
+from ..memory import DOCUMENT_EXTENSIONS, VOICE_EXTENSIONS
 from ..observability import metrics
+from ..text_files import FILE_TOKEN_LIMIT
 from ..work_queue import WorkQueue
 
 logger = logging.getLogger(__name__)
@@ -69,6 +72,7 @@ class AIKunClient(discord.Client):
         self.service = service
         self._response_queue = WorkQueue()
         self._message_tasks: set[asyncio.Task] = set()
+        self._history_tasks: set[asyncio.Task] = set()
         self.tree = RestrictedTree(self)
         self._register_commands()
 
@@ -102,6 +106,8 @@ class AIKunClient(discord.Client):
         # 接続終了後も、受付済みメッセージから後続の取り込みがキューへ入るまで待つ。
         if self._message_tasks:
             await asyncio.gather(*self._message_tasks, return_exceptions=True)
+        if self._history_tasks:
+            await asyncio.gather(*self._history_tasks, return_exceptions=True)
         await self._response_queue.join()
         await self.service.drain()
 
@@ -137,7 +143,7 @@ class AIKunClient(discord.Client):
         @app_commands.describe(text="保存するテキスト。許可チャンネルの利用者全員が参照できます")
         async def remember(interaction: discord.Interaction, text: str):
             async def operation():
-                result = await self.service.remember(text)
+                result = await self.service.remember(text, channel_id=interaction.channel_id)
                 return f"保存しました。文書ID: `{result['document_id']}`（{result['chunks']}チャンク）"
 
             await self._answer(interaction, operation, ephemeral=True)
@@ -149,8 +155,11 @@ class AIKunClient(discord.Client):
             async def operation():
                 if file.size > MAX_ATTACHMENT_BYTES:
                     raise InvalidInputError("添付は8 MiBまでです。")
-                result = await self.service.ingest_document(file.filename, await file.read())
-                return f"登録しました。文書ID: `{result['document_id']}`（{result['chunks']}チャンク）"
+                result = await self.service.ingest_document(
+                    file.filename, await file.read(), channel_id=interaction.channel_id
+                )
+                note = "（先頭4,096トークン以内のみ登録）" if result.get("truncated") else ""
+                return f"登録しました。文書ID: `{result['document_id']}`（{result['chunks']}チャンク）{note}"
 
             await self._answer(interaction, operation, ephemeral=True)
 
@@ -172,6 +181,29 @@ class AIKunClient(discord.Client):
         finally:
             self._message_tasks.discard(task)
 
+    def _schedule_backfill(self, channel_id: int):
+        task = asyncio.create_task(self._run_backfill(channel_id))
+        self._history_tasks.add(task)
+        task.add_done_callback(self._history_tasks.discard)
+
+    async def _run_backfill(self, channel_id: int):
+        try:
+            result = await self.service.backfill_channel(channel_id)
+            if result["imported"]:
+                logger.info(
+                    "auto backfill filled gaps channel=%s scanned=%d imported=%d documents=%d",
+                    channel_id,
+                    result["scanned"],
+                    result["imported"],
+                    result["documents"],
+                )
+        except Exception as exc:
+            logger.warning(
+                "auto backfill failed: %s (%s)",
+                type(exc).__name__,
+                exc.user_message() if isinstance(exc, AIKunError) else "詳細非表示",
+            )
+
     async def _handle_message(self, message: discord.Message) -> None:
         if message.author.bot or not allowed(self.settings, message.guild.id if message.guild else None):
             return
@@ -187,24 +219,8 @@ class AIKunClient(discord.Client):
                 exc.user_message() if isinstance(exc, AIKunError) else "詳細非表示",
             )
 
-        # 全自動バックフィル：観測したチャンネルの未保存分を、保存済みカーソルから
-        # 古い順に巻き戻して即取り込みする（フック有無とは無関係・常時）。
-        try:
-            result = await self.service.backfill_channel(message.channel.id)
-            if result["imported"]:
-                logger.info(
-                    "auto backfill filled gaps channel=%s scanned=%d imported=%d documents=%d",
-                    message.channel.id,
-                    result["scanned"],
-                    result["imported"],
-                    result["documents"],
-                )
-        except Exception as exc:
-            logger.warning(
-                "auto backfill failed: %s (%s)",
-                type(exc).__name__,
-                exc.user_message() if isinstance(exc, AIKunError) else "詳細非表示",
-            )
+        # 取得要求はすべて受け付けるが、返信は過去ログ取得の完了を待たない。
+        self._schedule_backfill(message.channel.id)
 
         content = message.content.strip()
         prefixes = (f"<@{self.user.id}>", f"<@!{self.user.id}>") if self.user else ()
@@ -213,22 +229,89 @@ class AIKunClient(discord.Client):
         elif content.startswith(prefixes):
             for prefix in prefixes:
                 content = content.removeprefix(prefix).strip()
-        else:
+        elif not any(
+            attachment.filename.lower().endswith(tuple(DOCUMENT_EXTENSIONS | IMAGE_EXTENSIONS))
+            for attachment in message.attachments
+        ):
             return
 
         async def operation():
-            text = content
-            if message.attachments:
-                if len(message.attachments) != 1:
-                    raise InvalidInputError("音声添付は1つずつ送ってください。資料は /ingest を使ってください。")
-                attachment = message.attachments[0]
-                if attachment.size > MAX_ATTACHMENT_BYTES:
-                    raise InvalidInputError("音声添付は8 MiBまでです。")
-                transcript = await self.service.transcribe_attachment(await attachment.read(), attachment.filename)
-                text = f"{text}\n{transcript}".strip()
-            return (await self.service.generate_reply(text)).content
+            return await self._process_attachments(content, message.attachments, message.channel.id)
 
         async with message.channel.typing():
             result = await self._run(operation)
         for chunk in split_message(result):
-            await message.reply(chunk, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+            await message.channel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+
+    async def _process_attachments(self, content: str, attachments, channel_id: int) -> str:
+        text = content
+        documents = []
+        images = []
+        receipts = []
+        prepared = []
+        audio_count = 0
+        tokens_remaining = FILE_TOKEN_LIMIT
+        # 全ファイルの形式・サイズを先に確認し、テキストを音声認識へ送らない。
+        for attachment in attachments:
+            name = attachment.filename.lower()
+            if attachment.size > MAX_ATTACHMENT_BYTES:
+                raise InvalidInputError("添付ファイルは1つ8 MiBまでです。")
+            if name.endswith(tuple(DOCUMENT_EXTENSIONS)):
+                prepared.append((attachment, "document"))
+            elif name.endswith(tuple(IMAGE_EXTENSIONS)):
+                prepared.append((attachment, "image"))
+            elif name.endswith(tuple(VOICE_EXTENSIONS)):
+                audio_count += 1
+                prepared.append((attachment, "audio"))
+            else:
+                raise InvalidInputError(
+                    "この添付形式には対応していません。テキスト資料・画像・音声ファイルを送ってください。"
+                )
+        if audio_count > 1:
+            raise InvalidInputError("音声ファイルは1つずつ送ってください。テキスト資料は複数添付できます。")
+        loaded = []
+        documents_remaining = sum(kind == "document" for _, kind in prepared)
+        for attachment, kind in prepared:
+            data = await attachment.read()
+            if len(data) > MAX_ATTACHMENT_BYTES:
+                raise InvalidInputError("添付ファイルは1つ8 MiBまでです。")
+            document = None
+            if kind == "document":
+                document = self.service.read_document(
+                    attachment.filename, data, token_limit=tokens_remaining // documents_remaining
+                )
+                tokens_remaining -= document.tokens
+                documents_remaining -= 1
+            loaded.append((attachment, kind, data, document))
+        for attachment, kind, data, document in loaded:
+            if kind == "audio":
+                transcript = await self.service.transcribe_attachment(data, attachment.filename)
+                text = f"{text}\n{transcript}".strip()
+            elif kind == "image":
+                images.append(image_data_url(data))
+            else:
+                label = f"attachment:{attachment.filename}"
+                if self.settings.memory.enabled:
+                    result = await self.service.ingest_document(
+                        attachment.filename, document.text.encode("utf-8"), channel_id=channel_id
+                    )
+                    label = f"document:{result['document_id']} ({attachment.filename})"
+                    receipts.append(f"{attachment.filename} を登録しました（{result['chunks']}チャンク）。")
+                else:
+                    receipts.append(f"{attachment.filename} を読み込みました。")
+                if document.truncated:
+                    receipts.append(f"{attachment.filename}: 先頭部分のみ読み込みました（添付合計4,096トークン上限）。")
+                documents.append(RetrievedItem(label=label, text=document.text))
+        if images and not text.strip():
+            text = "添付画像の内容を説明してください。"
+        if text.strip():
+            if images:
+                answer = await self.service.generate_reply(text, documents=documents, images=images)
+            elif documents:
+                answer = await self.service.generate_reply(text, documents=documents)
+            else:
+                answer = await self.service.generate_reply(text)
+            receipts.append(answer.content)
+        if not receipts:
+            raise InvalidInputError("質問か、テキスト資料・画像・音声ファイルを送ってください。")
+        return "\n\n".join(receipts)

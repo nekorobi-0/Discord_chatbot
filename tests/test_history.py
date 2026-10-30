@@ -335,3 +335,12 @@ def test_exclusive_importer_lock():
         with pytest.raises(ConfigurationError, match="実行中"):
             with importer_lock():
                 pytest.fail("must reject duplicate importer")
+
+
+async def test_duplicate_ids_inside_one_page_are_saved_once(embedded):
+    result = await embedded.ingest_history_page(23456, 34567, [message(1), message(1), message(2)])
+    assert result["scanned"] == 3
+    assert result["imported"] == 2
+    assert result["skipped"] == 1
+    with Session(get_engine()) as session:
+        assert len(session.exec(select(HistoryMessageRecord)).all()) == 2

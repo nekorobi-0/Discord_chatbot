@@ -12,6 +12,15 @@ from ai_kun.http_server import create_app
 from ai_kun.memory import ModelTurn
 
 
+@pytest.fixture(autouse=True)
+def no_history_network(monkeypatch):
+    monkeypatch.setattr(
+        ChatService,
+        "backfill_channel",
+        AsyncMock(return_value={"scanned": 0, "imported": 0, "skipped": 0, "documents": 0}),
+    )
+
+
 class Typing:
     async def __aenter__(self):
         return None
@@ -121,16 +130,17 @@ async def test_ingest_failure_does_not_break_hook_reply(settings, store, monkeyp
         id="9002",
         author=SimpleNamespace(bot=False, id="111"),
         guild=SimpleNamespace(id=23456),
-        channel=SimpleNamespace(id=45678, typing=Typing),
+        channel=SimpleNamespace(id=45678, typing=Typing, send=reply),
         content="!ai こんにちは",
         webhook_id=None,
         created_at=datetime(2026, 10, 30, 12, 0, tzinfo=UTC),
         attachments=[],
-        reply=reply,
+        reply=AsyncMock(),
     )
     await client.on_message(message)
     # 取り込みは失敗しても、フックへの返信は通常どおり届く。
     reply.assert_awaited_once()
+    message.reply.assert_not_awaited()
     assert "こんにちは" in reply.await_args.args[0]
     await client.close()
 
@@ -153,15 +163,17 @@ async def test_mention_and_prefix_reply(settings, store, monkeypatch):
         message = SimpleNamespace(
             author=SimpleNamespace(bot=False),
             guild=SimpleNamespace(id=23456),
-            channel=SimpleNamespace(id=34567, typing=Typing),
+            channel=SimpleNamespace(id=34567, typing=Typing, send=AsyncMock()),
             content=content,
             attachments=[],
             reply=AsyncMock(),
         )
         await client.on_message(message)
         generate.assert_awaited_with("テスト")
-        message.reply.assert_awaited_once()
-        assert message.reply.call_args.kwargs["allowed_mentions"].everyone is False
+        message.channel.send.assert_awaited_once()
+        message.reply.assert_not_awaited()
+        assert message.channel.send.call_args.kwargs["allowed_mentions"].everyone is False
+        assert "reference" not in message.channel.send.call_args.kwargs
     await client.close()
 
 
@@ -244,4 +256,234 @@ async def test_shutdown_waits_for_accepted_message_handlers(settings, store, mon
         await task
         if draining is not None:
             await draining
+        await client.close()
+
+
+def file_attachment(name, text):
+    data = text.encode("utf-8")
+    return SimpleNamespace(filename=name, size=len(data), read=AsyncMock(return_value=data))
+
+
+def file_message(content, attachments):
+    return SimpleNamespace(
+        id="9003",
+        author=SimpleNamespace(bot=False, id="111"),
+        guild=SimpleNamespace(id=23456),
+        channel=SimpleNamespace(id=34567, typing=Typing, send=AsyncMock()),
+        content=content,
+        attachments=attachments,
+        reply=AsyncMock(),
+        webhook_id=None,
+        created_at=datetime(2026, 10, 31, tzinfo=UTC),
+    )
+
+
+@pytest.mark.parametrize("content", ["", "!ai", "!ai この資料を要約して", "この資料を要約して"])
+async def test_text_attachment_uses_document_ingestion_without_asr(settings, store, monkeypatch, content):
+    from sqlmodel import Session, select
+
+    from ai_kun.db import MemoryDocumentRecord, get_engine
+
+    monkeypatch.setattr(store, "embed", AsyncMock(side_effect=lambda texts: [[1.0] * 64 for _ in texts]))
+    complete = AsyncMock(return_value=ModelTurn(content="資料の要約です"))
+    monkeypatch.setattr(store, "complete_chat", complete)
+    service = ChatService(settings, store)
+    transcribe = AsyncMock()
+    monkeypatch.setattr(service, "transcribe_attachment", transcribe)
+    client = AIKunClient(settings, service)
+    attachment = file_attachment("資料.TXT", "納期は金曜日。連絡先 alice@example.com")
+    message = file_message(content, [attachment])
+    try:
+        await client.on_message(message)
+        transcribe.assert_not_awaited()
+        attachment.read.assert_awaited_once()
+        message.reply.assert_not_awaited()
+        message.channel.send.assert_awaited()
+        sent = "".join(call.args[0] for call in message.channel.send.await_args_list)
+        assert "資料.TXT を登録しました" in sent
+        with Session(get_engine()) as session:
+            documents = session.exec(select(MemoryDocumentRecord).where(MemoryDocumentRecord.source == "upload")).all()
+            assert len(documents) == 1
+            assert "納期は金曜日" in documents[0].content
+        if "要約" in content:
+            complete.assert_awaited_once()
+            messages = complete.await_args.args[0]
+            assert any("納期は金曜日" in m["content"] and m["role"] == "system" for m in messages)
+            assert sum(m["content"].count("納期は金曜日") for m in messages) == 1
+            assert "資料の要約です" in sent
+        else:
+            complete.assert_not_awaited()
+        status = await service.ingestion_status()
+        assert status["stored"]["documents"] >= 1
+        assert any(job["kind"] == "document" for job in status["recent"])
+    finally:
+        await client.drain()
+        await client.close()
+
+
+async def test_multiple_files_share_4096_token_budget(settings, store, monkeypatch):
+    from sqlmodel import Session, select
+
+    from ai_kun.db import MemoryDocumentRecord, get_engine
+    from ai_kun.text_files import FILE_TOKEN_LIMIT, file_encoding
+
+    monkeypatch.setattr(store, "embed", AsyncMock(side_effect=lambda texts: [[1.0] * 64 for _ in texts]))
+    complete = AsyncMock(return_value=ModelTurn(content="確認しました"))
+    monkeypatch.setattr(store, "complete_chat", complete)
+    service = ChatService(settings, store)
+    client = AIKunClient(settings, service)
+    message = file_message(
+        "!ai 比較して",
+        [file_attachment("a.txt", "猫と犬の記録。" * 3000), file_attachment("b.md", "青と赤の記録。" * 3000)],
+    )
+    try:
+        await client.on_message(message)
+        with Session(get_engine()) as session:
+            documents = session.exec(select(MemoryDocumentRecord).where(MemoryDocumentRecord.source == "upload")).all()
+            assert len(documents) == 2
+            assert sum(len(file_encoding().encode(doc.content)) for doc in documents) <= FILE_TOKEN_LIMIT
+        sent = "".join(call.args[0] for call in message.channel.send.await_args_list)
+        assert "先頭部分のみ" in sent
+        assert "4,096" in sent
+        assert "確認しました" in sent
+    finally:
+        await client.drain()
+        await client.close()
+
+
+async def test_unsupported_attachment_is_not_sent_to_asr(settings, store, monkeypatch):
+    service = ChatService(settings, store)
+    monkeypatch.setattr(service, "ingest_message", AsyncMock())
+    transcribe = AsyncMock()
+    monkeypatch.setattr(service, "transcribe_attachment", transcribe)
+    client = AIKunClient(settings, service)
+    attachment = file_attachment("archive.zip", "not an audio file")
+    message = file_message("!ai 見て", [attachment])
+    try:
+        await client.on_message(message)
+        assert "対応していません" in message.channel.send.await_args.args[0]
+        transcribe.assert_not_awaited()
+        attachment.read.assert_not_awaited()
+    finally:
+        await client.close()
+
+
+async def test_audio_attachment_still_uses_transcription(settings, store, monkeypatch):
+    service = ChatService(settings, store)
+    monkeypatch.setattr(service, "ingest_message", AsyncMock())
+    transcribe = AsyncMock(return_value="文字起こしです")
+    generate = AsyncMock(return_value=SimpleNamespace(content="音声の返答"))
+    monkeypatch.setattr(service, "transcribe_attachment", transcribe)
+    monkeypatch.setattr(service, "generate_reply", generate)
+    client = AIKunClient(settings, service)
+    attachment = file_attachment("voice.ogg", "audio bytes")
+    message = file_message("!ai", [attachment])
+    try:
+        await client.on_message(message)
+        transcribe.assert_awaited_once_with(b"audio bytes", "voice.ogg")
+        generate.assert_awaited_once_with("文字起こしです")
+        assert message.channel.send.await_args.args[0] == "音声の返答"
+        message.reply.assert_not_awaited()
+    finally:
+        await client.close()
+
+
+async def test_text_attachment_can_be_read_without_rag_or_asr(settings, store, monkeypatch):
+    from dataclasses import replace
+
+    settings = replace(settings, memory=replace(settings.memory, enabled=False))
+    service = ChatService(settings, store)
+    complete = AsyncMock(return_value=ModelTurn(content="本文を読みました"))
+    monkeypatch.setattr(store, "complete_chat", complete)
+    transcribe = AsyncMock()
+    ingest = AsyncMock()
+    monkeypatch.setattr(service, "transcribe_attachment", transcribe)
+    monkeypatch.setattr(service, "ingest_document", ingest)
+    client = AIKunClient(settings, service)
+    message = file_message("!ai 要点は？", [file_attachment("memo.txt", "議題は次のリリース日です。")])
+    try:
+        await client.on_message(message)
+        ingest.assert_not_awaited()
+        transcribe.assert_not_awaited()
+        assert any("議題は次のリリース日" in m["content"] for m in complete.await_args.args[0])
+        assert "本文を読みました" in "".join(call.args[0] for call in message.channel.send.await_args_list)
+    finally:
+        await client.drain()
+        await client.close()
+
+
+async def test_oversized_file_is_rejected_before_download_or_asr(settings, store, monkeypatch):
+    service = ChatService(settings, store)
+    transcribe = AsyncMock()
+    monkeypatch.setattr(service, "transcribe_attachment", transcribe)
+    client = AIKunClient(settings, service)
+    attachment = file_attachment("large.txt", "small fixture")
+    attachment.size = 8 * 1024 * 1024 + 1
+    message = file_message("", [attachment])
+    try:
+        await client.on_message(message)
+        assert "8 MiB" in message.channel.send.await_args.args[0]
+        attachment.read.assert_not_awaited()
+        transcribe.assert_not_awaited()
+    finally:
+        await client.close()
+
+
+@pytest.mark.parametrize("content", ["", "!ai この画像を説明して", "画像を説明して"])
+async def test_image_attachment_reaches_multimodal_llm_without_asr(settings, store, monkeypatch, content):
+    import base64
+
+    image = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII="
+    )
+    monkeypatch.setattr(store, "embed", AsyncMock(side_effect=lambda texts: [[1.0] * 64 for _ in texts]))
+    complete = AsyncMock(return_value=ModelTurn(content="画像を確認しました"))
+    monkeypatch.setattr(store, "complete_chat", complete)
+    service = ChatService(settings, store)
+    transcribe = AsyncMock()
+    monkeypatch.setattr(service, "transcribe_attachment", transcribe)
+    client = AIKunClient(settings, service)
+    attachment = SimpleNamespace(filename="sample.PNG", size=len(image), read=AsyncMock(return_value=image))
+    message = file_message(content, [attachment])
+    try:
+        await client.on_message(message)
+        transcribe.assert_not_awaited()
+        parts = complete.await_args.args[0][-1]["content"]
+        assert parts[0]["type"] == "text"
+        assert parts[1]["type"] == "image_url"
+        assert parts[1]["image_url"]["detail"] == "low"
+        url = parts[1]["image_url"]["url"]
+        assert url.startswith("data:image/png;base64,")
+        assert base64.b64decode(url.split(",", 1)[1]) == image
+        assert message.channel.send.await_args.args[0] == "画像を確認しました"
+        message.reply.assert_not_awaited()
+    finally:
+        await client.drain()
+        await client.close()
+
+
+async def test_reply_does_not_wait_for_background_backfill(settings, store, monkeypatch):
+    import asyncio
+
+    service = ChatService(settings, store)
+    monkeypatch.setattr(service, "ingest_message", AsyncMock())
+    monkeypatch.setattr(service, "generate_reply", AsyncMock(return_value=SimpleNamespace(content="すぐ返答")))
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def backfill(channel):
+        entered.set()
+        await release.wait()
+        return {"scanned": 0, "imported": 0, "skipped": 0, "documents": 0}
+
+    monkeypatch.setattr(service, "backfill_channel", backfill)
+    client = AIKunClient(settings, service)
+    message = file_message("!ai 質問", [])
+    try:
+        await asyncio.wait_for(client.on_message(message), timeout=1)
+        await entered.wait()
+        assert not release.is_set()
+        message.channel.send.assert_awaited_once()
+    finally:
+        release.set()
+        await client.drain()
         await client.close()

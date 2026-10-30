@@ -19,8 +19,9 @@ from .errors import AIKunError, ConfigurationError, InvalidInputError, UpstreamE
 from .ingestion import stored_status
 from .memory import MemoryStore
 from .observability import AuditLog, metrics
+from .text_files import FILE_TOKEN_LIMIT, FileText, limit_file_text
 from .tools import ToolHub
-from .work_queue import WorkQueue
+from .work_queue import MessageQueue, WorkQueue
 
 logger = logging.getLogger("ai_kun.chat")
 
@@ -70,7 +71,9 @@ class ChatService:
             memory=settings.memory,
         )
         self._reply_lock = asyncio.Lock()
-        self._backfill_queue = WorkQueue()
+        self._backfill_queue = MessageQueue(self._backfill_batch)
+        self._custom_backfill_queue = WorkQueue()
+        self._live_queue = MessageQueue(self._memory.ingest_history_page)
         self._tools = ToolHub(search=settings.search, memory=self._memory)
 
     # ---------- 音声 ----------
@@ -91,18 +94,32 @@ class ChatService:
         return text
 
     # ---------- 記憶（RAG）----------
-    async def ingest_document(self, filename: str | None, data: bytes) -> dict[str, int | str]:
+    def read_document(self, filename: str | None, data: bytes, *, token_limit: int = FILE_TOKEN_LIMIT) -> FileText:
+        source = self._memory.read_document(filename, data)
+        # 長大なファイル全体をトークン化せず、文書の文字数上限内で計数する。
+        limited = limit_file_text(source[: self._settings.memory.max_chars_per_document], token_limit)
+        return FileText(limited.text, limited.tokens, source != limited.text)
+
+    async def ingest_document(
+        self, filename: str | None, data: bytes, *, channel_id: int | None = None
+    ) -> dict[str, int | str]:
         """添付テキスト資料を埋め込みインデックスに登録する。"""
         if not self._settings.memory.enabled:
             raise UpstreamError("記憶")
         name = (filename or "document.txt").rsplit("/", 1)[-1][-80:]
-        return await self._memory.ingest_document(name, data)
+        document = self.read_document(name, data)
+        result = await self._memory.ingest_document(
+            name, document.text.encode("utf-8"), guild_id=self._settings.discord.guild_id, channel_id=channel_id
+        )
+        return {**result, "truncated": document.truncated, "tokens": document.tokens}
 
-    async def remember(self, content: str) -> dict[str, int | str]:
-        return await self.ingest_document("memory.txt", content.encode("utf-8"))
+    async def remember(self, content: str, *, channel_id: int | None = None) -> dict[str, int | str]:
+        return await self.ingest_document("memory.txt", content.encode("utf-8"), channel_id=channel_id)
 
     async def ingest_message(self, message) -> dict[str, int]:
         """ライブの1発言をフック有無・内容に関係なくRAG記憶へ取り込む（問答無用）。"""
+        if not self._settings.memory.enabled:
+            return {"scanned": 1, "imported": 0, "skipped": 1, "documents": 0}
         author = getattr(message, "author", None)
         if author is None or getattr(author, "bot", False) or getattr(message, "webhook_id", None):
             return {"scanned": 1, "imported": 0, "skipped": 1, "documents": 0}
@@ -112,18 +129,17 @@ class ChatService:
         timestamp = getattr(message, "created_at", None)
         if timestamp is None:
             raise UpstreamError("Discord履歴の日時")
-        return await self._memory.ingest_history_page(
+        # 返却する件数は、この発言を含めて確定したバッチ全体の統計。
+        return await self._live_queue.submit(
             int(message.guild.id),
             int(message.channel.id),
-            [
-                {
-                    "id": str(message.id),
-                    "content": text,
-                    "timestamp": timestamp.isoformat(),
-                    "author": {"id": str(author.id)},
-                    "type": 0,
-                }
-            ],
+            {
+                "id": str(message.id),
+                "content": text,
+                "timestamp": timestamp.isoformat(),
+                "author": {"id": str(author.id)},
+                "type": 0,
+            },
         )
 
     async def backfill_channel(self, channel_id: int, *, api=None) -> dict[str, int]:
@@ -134,6 +150,8 @@ class ChatService:
 
         channel_id = int(channel_id)
         job = self._memory.ingestion.start(self._settings.discord.guild_id, channel_id, "backfill", queued=True)
+        if api is None:
+            return await self._backfill_queue.submit(self._settings.discord.guild_id, channel_id, {"job": job})
 
         async def operation():
             self._memory.ingestion.running(job)
@@ -145,10 +163,27 @@ class ChatService:
             self._memory.ingestion.finish(job, result=result)
             return result
 
-        return await self._backfill_queue.submit(operation)
+        return await self._custom_backfill_queue.submit(operation)
+
+    async def _backfill_batch(self, guild_id: int, channel_id: int, requests: list[dict]) -> dict:
+        from .history import backfill_channel as _backfill
+
+        for request in requests:
+            self._memory.ingestion.running(request["job"])
+        try:
+            result = await _backfill(self._settings, self._memory, channel_id)
+        except BaseException as exc:
+            for request in requests:
+                self._memory.ingestion.finish(request["job"], error=type(exc).__name__)
+            raise
+        for request in requests:
+            self._memory.ingestion.finish(request["job"], result={**result, "shared_requests": len(requests)})
+        return result
 
     async def drain(self) -> None:
+        await self._live_queue.join()
         await self._backfill_queue.join()
+        await self._custom_backfill_queue.join()
         await self._memory.ingestion_queue.join()
 
     async def ingestion_status(self) -> dict:
@@ -178,11 +213,15 @@ class ChatService:
         return await self._retrieve(query)
 
     # ---------- 応答 ----------
-    async def generate_reply(self, content: str) -> ChatResult:
+    async def generate_reply(
+        self, content: str, *, documents: Sequence[RetrievedItem] = (), images: Sequence[str] = ()
+    ) -> ChatResult:
         async with self._reply_lock:
-            return await self._generate_reply(content)
+            return await self._generate_reply(content, documents=documents, images=images)
 
-    async def _generate_reply(self, content: str) -> ChatResult:
+    async def _generate_reply(
+        self, content: str, *, documents: Sequence[RetrievedItem] = (), images: Sequence[str] = ()
+    ) -> ChatResult:
         """RAG を経由したうえで、1 往復の応答を返す。履歴は一切残さない。"""
         started = time.monotonic()
         raw = (content or "").strip()
@@ -192,10 +231,11 @@ class ChatService:
             raise InvalidInputError("ちょっと長すぎちゃった。分割してもう一回おねがい。")
 
         # 質問はすべて記憶検索を対象にする（オプトアウト廃止）。
-        items = await self._retrieve(raw)
+        attached = {document.label.split(" ", 1)[0] for document in documents}
+        items = tuple(item for item in await self._retrieve(raw) if item.label.split(" ", 1)[0] not in attached)
         if items:
             metrics.increment("ai_kun.memory_retrievals_total")
-        messages = self._build_messages(raw, items)
+        messages = self._build_messages(raw, (*documents, *items), images=images)
 
         content_text = await self._run_tool_loop(messages)
         truncated = len(content_text) > self._settings.operational.max_output_chars
@@ -239,7 +279,9 @@ class ChatService:
             return ()
         return tuple(RetrievedItem(label=h.label, text=h.text) for h in hits)
 
-    def _build_messages(self, user_text: str, items: Sequence[RetrievedItem]) -> list[dict[str, object]]:
+    def _build_messages(
+        self, user_text: str, items: Sequence[RetrievedItem], *, images: Sequence[str] = ()
+    ) -> list[dict[str, object]]:
         prompt = SYSTEM_PROMPT
         if not items:
             prompt += "\n今回参照できた保存記憶はありません。過去の話を覚えていると主張しないでください。"
@@ -249,7 +291,12 @@ class ChatService:
             for item in items:
                 block.append(f"〔{item.label}〕\n{item.text}")
             messages.append({"role": "system", "content": "\n\n".join(block)[:24_000]})
-        messages.append({"role": "user", "content": user_text})
+        if images:
+            parts = [{"type": "text", "text": user_text}]
+            parts.extend({"type": "image_url", "image_url": {"url": image, "detail": "low"}} for image in images)
+            messages.append({"role": "user", "content": parts})
+        else:
+            messages.append({"role": "user", "content": user_text})
         return messages
 
     async def _run_tool_loop(self, messages: list[dict[str, object]]) -> str:

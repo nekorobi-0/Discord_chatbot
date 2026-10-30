@@ -15,7 +15,7 @@
 <div class="cards" aria-live="polite">
 <div class="card"><div class="label">検索可能な発言</div><div class="value" id="searchable">—</div><small>現在のモデルで検索できる件数</small></div>
 <div class="card"><div class="label">処理済みの発言</div><div class="value" id="processed">—</div><small>対象外・削除済みを含む記録数</small></div>
-<div class="card"><div class="label">保存文書</div><div class="value" id="documents">—</div><small>複数の発言をまとめた文書数</small></div>
+<div class="card"><div class="label">保存文書</div><div class="value" id="documents">—</div><small>Discord発言と添付・登録資料</small></div>
 <div class="card"><div class="label">検索チャンク</div><div class="value" id="chunks">—</div><small>現在のモデルのベクトル数</small></div>
 </div>
 <section><div class="section-head"><h2>現在の処理</h2><span class="tag" id="active-count">—</span></div><div id="active-list"><div class="empty">状態を取得中…</div></div></section>
@@ -27,12 +27,19 @@
 <script>
 const el=id=>document.getElementById(id);
 const count=n=>new Intl.NumberFormat('ja-JP').format(n);
-const kind=k=>k==='backfill'?'過去ログの取得・取り込み':'発言のベクトル化・保存';
+const kind=k=>k==='backfill'?'過去ログの取得・取り込み':k==='document'?'テキスト資料の取り込み':'発言のベクトル化・保存';
 const time=t=>new Date(t).toLocaleString('ja-JP');
 function node(tag,text,className){const e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(className)e.className=className;return e;}
 function channel(id,guild,message){const a=node('a','# '+id);a.href='https://discord.com/channels/'+encodeURIComponent(guild)+'/'+encodeURIComponent(id)+(message?'/'+encodeURIComponent(message):'');a.target='_blank';a.rel='noopener noreferrer';return a;}
 function cell(row,child){const td=node('td');td.append(child);row.append(td);}
-function result(job){if(job.error)return '失敗: '+job.error;const r=job.result;return `投入 ${count(r.imported||0)} / 対象外・既存 ${count(r.skipped||0)} / 文書 ${count(r.documents||0)}`;}
+function result(job){
+  const r=job.result;
+  const timing=job.elapsed_seconds!==undefined?` · 処理 ${job.elapsed_seconds.toFixed(2)}秒 / 待機 ${job.queued_seconds.toFixed(2)}秒`:'';
+  if(job.error)return '失敗: '+job.error+timing;
+  if(job.kind==='document')return `文書 ${count(r.documents||0)} / チャンク ${count(r.chunks||0)}`+timing;
+  return `投入 ${count(r.imported||0)} / 対象外・既存 ${count(r.skipped||0)} / 文書 ${count(r.documents||0)}`+(r.shared_requests>1?` · ${count(r.shared_requests)}要求の共有取得`:'')+timing;
+}
+
 function render(data){
   for(const key of ['searchable','processed','documents','chunks'])el(key).textContent=count(data.stored[key]);
   el('model').textContent=`${data.model} · ${data.dimension}次元`;

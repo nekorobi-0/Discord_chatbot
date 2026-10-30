@@ -75,3 +75,44 @@ async def test_cancelled_waiter_does_not_cancel_accepted_work():
         release.set()
         await asyncio.gather(first_task, *([second_task] if second_task else []), return_exceptions=True)
         await queue.join()
+
+
+async def test_message_queue_batches_without_dropping_requests_and_preserves_channel_order():
+    from ai_kun.work_queue import MessageQueue
+
+    calls = []
+
+    async def handler(guild, channel, messages):
+        calls.append((channel, [m["id"] for m in messages]))
+        if channel == 2:
+            raise ValueError("test failure")
+        return {"imported": len(messages)}
+
+    queue = MessageQueue(handler, window=0)
+    channels = [1, 1, 2, 1, 3, 3]
+    results = await asyncio.gather(
+        *[queue.submit(10, channel, {"id": index}) for index, channel in enumerate(channels)], return_exceptions=True
+    )
+    await queue.join()
+    assert calls == [(1, [0, 1]), (2, [2]), (1, [3]), (3, [4, 5])]
+    assert isinstance(results[2], ValueError)
+    assert [result["imported"] for index, result in enumerate(results) if index != 2] == [2, 2, 1, 2, 2]
+
+
+async def test_message_queue_keeps_cancelled_waiter_payload():
+    from ai_kun.work_queue import MessageQueue
+
+    calls = []
+
+    async def handler(guild, channel, messages):
+        calls.extend(message["id"] for message in messages)
+        return {"imported": len(messages)}
+
+    queue = MessageQueue(handler, window=0.01)
+    task = asyncio.create_task(queue.submit(1, 2, {"id": 100}))
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await queue.join()
+    assert calls == [100]

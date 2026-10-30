@@ -15,6 +15,7 @@ import ipaddress
 import logging
 import os
 import re
+import time
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ from urllib.parse import urlparse
 import httpx
 import numpy as np
 from sqlalchemy import delete
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlmodel import Session, select
 
 from .config import ASRSettings, EmbeddingSettings, LLMSettings, MemorySettings, _is_internal_host
@@ -43,8 +45,8 @@ from .work_queue import WorkQueue
 logger = logging.getLogger("ai_kun.memory")
 
 _MAX_UPLOAD_BYTES = 8 * 1024 * 1024
-_DOC_EXTENSIONS = frozenset({".txt", ".md", ".markdown", ".log", ".csv", ".json", ".yaml", ".yml"})
-_VOICE_EXTENSIONS = frozenset({".ogg", ".mp4", ".webm", ".mkv", ".mp3", ".wav", ".m4a", ".aac", ".flac", ".opus"})
+DOCUMENT_EXTENSIONS = frozenset({".txt", ".md", ".markdown", ".log", ".csv", ".json", ".yaml", ".yml"})
+VOICE_EXTENSIONS = frozenset({".ogg", ".mp4", ".webm", ".mkv", ".mp3", ".wav", ".m4a", ".aac", ".flac", ".opus"})
 _CHUNK_MARKER_RE = re.compile(r"^\s*\[\[\d{1,3}/\d{1,3}\]\]\s*$", re.MULTILINE)
 _CONTROL_CHARS_RE = re.compile(r"[^\S\n\r\t\u00a0-\u1680\u2000-\u2fff]+")
 
@@ -163,8 +165,8 @@ class MemoryStore:
         if response.status_code == 429:
             raise RateLimitError()
         if response.status_code >= 400:
-            logger.warning("llm http error", extra={"status": response.status_code})
-            raise UpstreamError("おしゃべりの仕組み")
+            logger.warning("llm http error: status=%s model=%s", response.status_code, self._llm.model)
+            raise UpstreamError(f"LLM HTTP {response.status_code} (model={self._llm.model})")
         try:
             data = response.json()
         except ValueError as exc:
@@ -195,68 +197,103 @@ class MemoryStore:
 
     # ---------- Embedding（キャッシュ付き・鍵は外に出さない）----------
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        vectors: list[list[float]] = []
-        for text in texts:
-            digest = hashlib.sha256(
+        if not texts:
+            return []
+        digests = [
+            hashlib.sha256(
                 f"{self._embedding.model}:{self._embedding.dimension}\n{text}".encode("utf-8", "ignore")
             ).hexdigest()
+            for text in texts
+        ]
+        unique = dict(zip(digests, texts, strict=True))
+        vectors = {}
+        keys = list(unique)
+        with Session(get_engine()) as session:
+            for offset in range(0, len(keys), 256):
+                for cached in session.exec(
+                    select(EmbeddingCacheRecord).where(EmbeddingCacheRecord.digest.in_(keys[offset : offset + 256]))
+                ):
+                    vector = _decode_vector(cached.vector, self._embedding.dimension)
+                    if vector is not None:
+                        vectors[cached.digest] = vector
+        missing = [digest for digest in unique if digest not in vectors]
+        for offset in range(0, len(missing), 16):
+            batch = missing[offset : offset + 16]
+            result = await self._embed_batch_uncached([unique[digest] for digest in batch])
+            vectors.update(zip(batch, result, strict=True))
+        if missing:
             with Session(get_engine()) as session:
-                cached = session.exec(select(EmbeddingCacheRecord).where(EmbeddingCacheRecord.digest == digest)).first()
-            if cached is not None:
-                vector = _decode_vector(cached.vector, self._embedding.dimension)
-                if vector is None:
-                    logger.warning("embedding cache entry unreadable")
-                else:
-                    vectors.append(vector)
-                    continue
-            vector = await self._embed_uncached(text)
-            with Session(get_engine()) as session:
-                session.add(
-                    EmbeddingCacheRecord(digest=digest, model=self._embedding.model, vector=_encode_vector(vector))
-                )
                 try:
+                    for offset in range(0, len(missing), 128):
+                        rows = [
+                            {
+                                "digest": digest,
+                                "model": self._embedding.model,
+                                "vector": _encode_vector(vectors[digest]),
+                            }
+                            for digest in missing[offset : offset + 128]
+                        ]
+                        statement = sqlite_insert(EmbeddingCacheRecord).values(rows)
+                        session.execute(
+                            statement.on_conflict_do_update(
+                                index_elements=["digest"],
+                                set_={"model": statement.excluded.model, "vector": statement.excluded.vector},
+                            )
+                        )
                     session.commit()
                 except Exception:
                     session.rollback()
                     logger.warning("embedding cache write failed")
-            vectors.append(vector)
-        return vectors
+        return [vectors[digest] for digest in digests]
 
     async def _embed_uncached(self, text: str) -> list[float]:
+        return (await self._embed_batch_uncached([text]))[0]
+
+    async def _embed_batch_uncached(self, texts: Sequence[str]) -> list[list[float]]:
         headers = {"Authorization": f"Bearer {self._embedding.api_key}"} if self._embedding.api_key else {}
+        started = time.perf_counter()
         response = await self._request(
             "POST",
             f"{self._embedding.base_url.rstrip('/')}/embeddings",
-            json={"model": self._embedding.model, "input": text, "dimensions": self._embedding.dimension},
+            json={
+                "model": self._embedding.model,
+                "input": texts[0] if len(texts) == 1 else list(texts),
+                "dimensions": self._embedding.dimension,
+            },
             headers=headers,
         )
         if response.status_code == 429:
             raise RateLimitError()
         if response.status_code >= 400:
             logger.warning(
-                "embedding http error: status=%s model=%s dimensions=%s",
+                "embedding http error: status=%s model=%s dimensions=%s inputs=%s",
                 response.status_code,
                 self._embedding.model,
                 self._embedding.dimension,
+                len(texts),
             )
             raise UpstreamError(f"Embedding HTTP {response.status_code} (model={self._embedding.model})")
         try:
             data = response.json()
-        except ValueError as exc:
-            raise UpstreamError("記憶のしくみ") from exc
-        items = data.get("data") or []
-        if not items or not isinstance(items[0].get("embedding"), list):
-            raise UpstreamError("記憶のしくみ")
-        vector = [float(v) for v in items[0]["embedding"]]
-        if len(vector) != self._embedding.dimension:
+            items = data["data"]
+            if len(items) != len(texts):
+                raise ValueError("embedding count mismatch")
+            indexed = {item.get("index", 0 if len(texts) == 1 else None): item for item in items}
+            if set(indexed) != set(range(len(texts))):
+                raise ValueError("embedding indices mismatch")
+            vectors = [[float(value) for value in indexed[index]["embedding"]] for index in range(len(texts))]
+            if any(len(vector) != self._embedding.dimension or not np.isfinite(vector).all() for vector in vectors):
+                raise ValueError("embedding dimension mismatch or non-finite vector")
+        except (ValueError, TypeError, KeyError, OverflowError) as exc:
             logger.warning(
-                "embedding dimension mismatch: expected=%s got=%s model=%s",
+                "invalid embedding response: expected_inputs=%s dimension=%s model=%s",
+                len(texts),
                 self._embedding.dimension,
-                len(vector),
                 self._embedding.model,
             )
-            raise UpstreamError("記憶のしくみ")
-        return vector
+            raise UpstreamError("記憶のしくみ") from exc
+        logger.info("embedding batch complete: inputs=%d seconds=%.3f", len(texts), time.perf_counter() - started)
+        return vectors
 
     # ---------- 音声（CPU / faster-whisper / ローカルモデルのみ）----------
     async def transcribe(self, data: bytes, filename: str | None) -> str:
@@ -265,7 +302,7 @@ class MemoryStore:
         if len(data) > _MAX_UPLOAD_BYTES:
             raise InvalidInputError("音声が長すぎたよ。短く区切ってもう一回おねがい。")
         name = (filename or "voice.ogg").lower()
-        if not name.endswith(tuple(_VOICE_EXTENSIONS)):
+        if not name.endswith(tuple(VOICE_EXTENSIONS)):
             raise InvalidInputError("この音声はうまく扱えなかったよ。")
         return await asyncio.to_thread(self._transcribe_blocking, data)
 
@@ -297,23 +334,52 @@ class MemoryStore:
                 pass
 
     # ---------- 資料の取り込み ----------
-    async def ingest_document(self, filename: str | None, data: bytes) -> dict[str, int | str]:
-        if not self._memory.enabled:
-            raise UpstreamError("記憶")
+    def read_document(self, filename: str | None, data: bytes) -> str:
         if len(data) > _MAX_UPLOAD_BYTES:
             raise InvalidInputError("ファイルが大きすぎたよ。もっと小さくしてほしいな。")
         name = (filename or "document.txt").lower()
-        if not name.endswith(tuple(_DOC_EXTENSIONS)):
+        if not name.endswith(tuple(DOCUMENT_EXTENSIONS)):
             raise InvalidInputError("この形式の資料はまだ扱えないよ。テキスト形式にしてくれる？")
         try:
             text = io.BytesIO(data).read().decode("utf-8", "replace")
         except Exception as exc:
             raise InvalidInputError("資料を読み取れなかったよ。") from exc
-        if len(text) > self._memory.max_chars_per_document:
-            raise InvalidInputError("資料が長すぎたよ。分割してほしいな。")
-        text = _sanitize_text(text)[: self._memory.max_chars_per_document]
+        text = _sanitize_text(text)
         if not text.strip():
             raise InvalidInputError("からっぽの資料だったよ。")
+
+        return text
+
+    async def ingest_document(
+        self, filename: str | None, data: bytes, *, guild_id: int | None = None, channel_id: int | None = None
+    ) -> dict[str, int | str]:
+        job = (
+            self.ingestion.start(guild_id, channel_id, "document", queued=True)
+            if guild_id is not None and channel_id is not None
+            else None
+        )
+
+        async def operation():
+            if job:
+                self.ingestion.running(job)
+            try:
+                result = await self._ingest_document(filename, data)
+            except BaseException as exc:
+                if job:
+                    self.ingestion.finish(job, error=type(exc).__name__)
+                raise
+            if job:
+                self.ingestion.finish(job, result={"documents": 1, "chunks": result["chunks"]})
+            return result
+
+        return await self.ingestion_queue.submit(operation)
+
+    async def _ingest_document(self, filename: str | None, data: bytes) -> dict[str, int | str]:
+        if not self._memory.enabled:
+            raise UpstreamError("記憶")
+        text = self.read_document(filename, data)
+        if len(text) > self._memory.max_chars_per_document:
+            raise InvalidInputError("資料が長すぎたよ。分割してほしいな。")
 
         document_id = uuid.uuid4().hex
         chunks: list[tuple[str, str]] = []
@@ -336,8 +402,8 @@ class MemoryStore:
                     created_at=datetime.now(UTC),
                 )
             )
-            # 外部キー制約を満たすため、文書を先に確定させてからチャンクを書き込む。
-            session.commit()
+            # 文書を先にflushし、チャンクと合わせて1トランザクションで確定する。
+            session.flush()
             for (chunk_id, piece), vector in zip(chunks, vectors, strict=True):
                 session.add(
                     MemoryChunkRecord(
@@ -386,10 +452,14 @@ class MemoryStore:
         length = 0
         previous = None
         skipped = []
+        encountered = set()
+        duplicate_count = 0
         for message in messages:
             message_id = str(message["id"])
-            if message_id in seen:
+            if message_id in seen or message_id in encountered:
+                duplicate_count += 1
                 continue
+            encountered.add(message_id)
             author = message.get("author") or {}
             # 問答無用で全ログをRAGへ。オプトアウトも秘密検出による除外も廃止した。
             text = str(message.get("content") or "").strip()
@@ -431,8 +501,14 @@ class MemoryStore:
                 pieces.append(text[start : start + self._memory.chunk_size])
                 if start + self._memory.chunk_size >= len(text):
                     break
-            vectors = await self.embed(pieces)
-            prepared.append((document_id, text, group, pieces, vectors))
+            prepared.append((document_id, text, group, pieces))
+        all_vectors = await self.embed([piece for _, _, _, pieces in prepared for piece in pieces])
+        offset = 0
+        with_vectors = []
+        for document_id, text, group, pieces in prepared:
+            with_vectors.append((document_id, text, group, pieces, all_vectors[offset : offset + len(pieces)]))
+            offset += len(pieces)
+        prepared = with_vectors
 
         # Embedding失敗時にはここへ到達しないため、カーソルも進まず同じページから再開できる。
         now = datetime.now(UTC)
@@ -447,8 +523,8 @@ class MemoryStore:
                         created_at=now,
                     )
                 )
-            # 外部キー制約を満たすため、文書を先に確定させてから検索チャンクを書き込む。
-            session.commit()
+            # 文書・チャンク・カーソルを1トランザクションで確定する。
+            session.flush()
             for document_id, text, group, pieces, vectors in prepared:
                 for piece, vector in zip(pieces, vectors, strict=True):
                     session.add(
@@ -487,7 +563,7 @@ class MemoryStore:
         return {
             "scanned": len(messages),
             "imported": sum(len(group) for group in groups),
-            "skipped": len(skipped) + len(seen),
+            "skipped": len(skipped) + duplicate_count,
             "documents": len(groups),
         }
 

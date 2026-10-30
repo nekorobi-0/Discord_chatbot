@@ -216,3 +216,79 @@ async def test_backfill_queues_all_requests_including_same_channel(settings, sto
     finally:
         release.set()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_uploaded_document_is_truncated_before_ingestion(settings, store, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from sqlmodel import Session, select
+
+    from ai_kun.db import MemoryDocumentRecord, get_engine
+    from ai_kun.text_files import FILE_TOKEN_LIMIT, file_encoding
+
+    monkeypatch.setattr(store, "embed", AsyncMock(side_effect=lambda texts: [[1.0] * 64 for _ in texts]))
+    service = ChatService(settings, store)
+    result = await service.ingest_document("long.txt", ("ファイル入力の速度確認。" * 4000).encode(), channel_id=34567)
+    assert result["truncated"] is True
+    assert result["tokens"] <= FILE_TOKEN_LIMIT
+    with Session(get_engine()) as session:
+        document = session.exec(select(MemoryDocumentRecord)).one()
+        assert 0 < len(file_encoding().encode(document.content)) <= FILE_TOKEN_LIMIT
+    status = await service.ingestion_status()
+    assert status["stored"]["documents"] == 1
+    assert status["stored"]["chunks"] == result["chunks"]
+    assert status["recent"][0]["kind"] == "document"
+
+
+async def test_live_message_burst_is_batched_without_losing_messages(settings, store, monkeypatch):
+    import asyncio
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from sqlmodel import Session, select
+
+    from ai_kun.db import HistoryMessageRecord, get_engine
+
+    monkeypatch.setattr(store, "embed", AsyncMock(side_effect=lambda texts: [[1.0] * 64 for _ in texts]))
+    original = store.ingest_history_page
+    page = AsyncMock(wraps=original)
+    monkeypatch.setattr(store, "ingest_history_page", page)
+    service = ChatService(settings, store)
+    messages = [
+        SimpleNamespace(
+            id=index,
+            content=f"新着の発言{index}",
+            author=SimpleNamespace(id=42, bot=False),
+            guild=SimpleNamespace(id=23456),
+            channel=SimpleNamespace(id=34567),
+            created_at=datetime(2026, 10, 31, tzinfo=UTC),
+            webhook_id=None,
+        )
+        for index in range(100, 120)
+    ]
+    results = await asyncio.gather(*[service.ingest_message(message) for message in messages])
+    await service.drain()
+    assert len(results) == 20
+    assert all(result["imported"] == 20 for result in results)
+    page.assert_awaited_once()
+    assert len(page.await_args.args[2]) == 20
+    with Session(get_engine()) as session:
+        assert len(session.exec(select(HistoryMessageRecord)).all()) == 20
+
+
+async def test_backfill_burst_shares_scan_but_completes_every_request(settings, store, monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    result = {"scanned": 10, "imported": 10, "skipped": 0, "documents": 1}
+    scan = AsyncMock(return_value=result)
+    monkeypatch.setattr("ai_kun.history.backfill_channel", scan)
+    service = ChatService(settings, store)
+    results = await asyncio.gather(*[service.backfill_channel(34567) for _ in range(100)])
+    await service.drain()
+    assert results == [result] * 100
+    scan.assert_awaited_once()
+    status = await service.ingestion_status()
+    assert len(status["recent"]) == 100
+    assert all(job["status"] == "completed" and job["result"]["shared_requests"] == 100 for job in status["recent"])
