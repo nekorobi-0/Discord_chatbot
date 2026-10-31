@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import io
 import ipaddress
 import logging
 import os
@@ -41,6 +40,8 @@ from .db import (
 )
 from .discord_users import message_users, remember_users
 from .errors import InvalidInputError, RateLimitError, UpstreamError
+from .file_types import DOCUMENT_EXTENSIONS as DOCUMENT_EXTENSIONS
+from .file_types import VOICE_EXTENSIONS, decode_text_file
 from .ingestion import IngestionMonitor
 from .request_diagnostics import phase, request_id
 from .work_queue import WorkQueue
@@ -48,8 +49,6 @@ from .work_queue import WorkQueue
 logger = logging.getLogger("ai_kun.memory")
 
 _MAX_UPLOAD_BYTES = 8 * 1024 * 1024
-DOCUMENT_EXTENSIONS = frozenset({".txt", ".md", ".markdown", ".log", ".csv", ".json", ".yaml", ".yml"})
-VOICE_EXTENSIONS = frozenset({".ogg", ".mp4", ".webm", ".mkv", ".mp3", ".wav", ".m4a", ".aac", ".flac", ".opus"})
 _CHUNK_MARKER_RE = re.compile(r"^\s*\[\[\d{1,3}/\d{1,3}\]\]\s*$", re.MULTILINE)
 _CONTROL_CHARS_RE = re.compile(r"[^\S\n\r\t\u00a0-\u1680\u2000-\u2fff]+")
 _HISTORY_HEADER = re.compile(r"(?m)^\[\d{4}-\d{2}-\d{2}T[^\]\n]+\] member-([0-9]{5,25}): ")
@@ -369,17 +368,10 @@ class MemoryStore:
                 pass
 
     # ---------- 資料の取り込み ----------
-    def read_document(self, filename: str | None, data: bytes) -> str:
+    def read_document(self, filename: str | None, data: bytes, *, content_type: str | None = None) -> str:
         if len(data) > _MAX_UPLOAD_BYTES:
             raise InvalidInputError("ファイルが大きすぎたよ。もっと小さくしてほしいな。")
-        name = (filename or "document.txt").lower()
-        if not name.endswith(tuple(DOCUMENT_EXTENSIONS)):
-            raise InvalidInputError("この形式の資料はまだ扱えないよ。テキスト形式にしてくれる？")
-        try:
-            text = io.BytesIO(data).read().decode("utf-8", "replace")
-        except Exception as exc:
-            raise InvalidInputError("資料を読み取れなかったよ。") from exc
-        text = _sanitize_text(text)
+        text = decode_text_file(filename, data, content_type)
         if not text.strip():
             raise InvalidInputError("からっぽの資料だったよ。")
 
@@ -420,8 +412,8 @@ class MemoryStore:
         chunks: list[tuple[str, str]] = []
         step = max(1, self._memory.chunk_size - self._memory.chunk_overlap)
         for start in range(0, len(text), step):
-            piece = text[start : start + self._memory.chunk_size].strip()
-            if piece:
+            piece = text[start : start + self._memory.chunk_size]
+            if piece.strip():
                 chunks.append((uuid.uuid4().hex, piece))
             if start + self._memory.chunk_size >= len(text):
                 break

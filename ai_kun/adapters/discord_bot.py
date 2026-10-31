@@ -15,8 +15,8 @@ from ..config import Settings
 from ..discord_context import DiscordContext
 from ..discord_users import public_user_names, remember_users, sdk_user
 from ..errors import AIKunError, InvalidInputError
-from ..images import IMAGE_EXTENSIONS, image_data_url
-from ..memory import DOCUMENT_EXTENSIONS, VOICE_EXTENSIONS
+from ..file_types import attachment_kind, is_document_trigger
+from ..images import image_data_url
 from ..observability import metrics
 from ..request_diagnostics import RequestTrace, current_trace, phase
 from ..text_files import FILE_TOKEN_LIMIT
@@ -312,7 +312,10 @@ class AIKunClient(discord.Client):
                 if file.size > MAX_ATTACHMENT_BYTES:
                     raise InvalidInputError("添付は8 MiBまでです。")
                 result = await self.service.ingest_document(
-                    file.filename, await file.read(), channel_id=interaction.channel_id
+                    file.filename,
+                    await file.read(),
+                    channel_id=interaction.channel_id,
+                    content_type=getattr(file, "content_type", None),
                 )
                 note = "（先頭4,096トークン以内のみ登録）" if result.get("truncated") else ""
                 return f"登録しました。文書ID: `{result['document_id']}`（{result['chunks']}チャンク）{note}"
@@ -402,7 +405,8 @@ class AIKunClient(discord.Client):
         elif is_bot_reply:
             pass
         elif not any(
-            attachment.filename.lower().endswith(tuple(DOCUMENT_EXTENSIONS)) for attachment in message.attachments
+            is_document_trigger(attachment.filename, getattr(attachment, "content_type", None))
+            for attachment in message.attachments
         ):
             return
 
@@ -449,20 +453,17 @@ class AIKunClient(discord.Client):
         tokens_remaining = FILE_TOKEN_LIMIT
         # 全ファイルの形式・サイズを先に確認し、テキストを音声認識へ送らない。
         for attachment in attachments:
-            name = attachment.filename.lower()
             if attachment.size > MAX_ATTACHMENT_BYTES:
                 raise InvalidInputError("添付ファイルは1つ8 MiBまでです。")
-            if name.endswith(tuple(DOCUMENT_EXTENSIONS)):
-                prepared.append((attachment, "document"))
-            elif name.endswith(tuple(IMAGE_EXTENSIONS)):
-                prepared.append((attachment, "image"))
-            elif name.endswith(tuple(VOICE_EXTENSIONS)):
-                audio_count += 1
-                prepared.append((attachment, "audio"))
-            else:
+            kind = attachment_kind(attachment.filename, getattr(attachment, "content_type", None))
+            if kind == "unsupported":
                 raise InvalidInputError(
                     "この添付形式には対応していません。テキスト資料・画像・音声ファイルを送ってください。"
                 )
+            if kind == "audio":
+                audio_count += 1
+            # 不明な形式は実データを検証し、読めるテキストだけを資料にする。
+            prepared.append((attachment, "document" if kind == "unknown" else kind))
         if audio_count > 1:
             raise InvalidInputError("音声ファイルは1つずつ送ってください。テキスト資料は複数添付できます。")
         loaded = []
@@ -474,7 +475,10 @@ class AIKunClient(discord.Client):
             document = None
             if kind == "document":
                 document = self.service.read_document(
-                    attachment.filename, data, token_limit=tokens_remaining // documents_remaining
+                    attachment.filename,
+                    data,
+                    token_limit=tokens_remaining // documents_remaining,
+                    content_type=getattr(attachment, "content_type", None),
                 )
                 tokens_remaining -= document.tokens
                 documents_remaining -= 1
@@ -502,9 +506,7 @@ class AIKunClient(discord.Client):
                 text = "添付資料の要点を短くまとめてください。"
         if text.strip():
             if images:
-                answer = await self.service.generate_reply(
-                    text, documents=documents, images=images, channel_id=channel_id
-                )
+                answer = await self.service.generate_reply(text, documents=documents, images=images, **reply_kwargs)
             elif documents:
                 answer = await self.service.generate_reply(text, documents=documents, **reply_kwargs)
             else:

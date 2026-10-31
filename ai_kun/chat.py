@@ -103,20 +103,32 @@ class ChatService:
         return text
 
     # ---------- 記憶（RAG）----------
-    def read_document(self, filename: str | None, data: bytes, *, token_limit: int = FILE_TOKEN_LIMIT) -> FileText:
-        source = self._memory.read_document(filename, data)
+    def read_document(
+        self,
+        filename: str | None,
+        data: bytes,
+        *,
+        token_limit: int = FILE_TOKEN_LIMIT,
+        content_type: str | None = None,
+    ) -> FileText:
+        source = self._memory.read_document(filename, data, content_type=content_type)
         # 長大なファイル全体をトークン化せず、文書の文字数上限内で計数する。
         limited = limit_file_text(source[: self._settings.memory.max_chars_per_document], token_limit)
         return FileText(limited.text, limited.tokens, source != limited.text)
 
     async def ingest_document(
-        self, filename: str | None, data: bytes, *, channel_id: int | None = None
+        self,
+        filename: str | None,
+        data: bytes,
+        *,
+        channel_id: int | None = None,
+        content_type: str | None = None,
     ) -> dict[str, int | str]:
         """添付テキスト資料を埋め込みインデックスに登録する。"""
         if not self._settings.memory.enabled:
             raise UpstreamError("記憶")
         name = (filename or "document.txt").rsplit("/", 1)[-1][-80:]
-        document = self.read_document(name, data)
+        document = self.read_document(name, data, content_type=content_type)
         result = await self._memory.ingest_document(
             name, document.text.encode("utf-8"), guild_id=self._settings.discord.guild_id, channel_id=channel_id
         )
