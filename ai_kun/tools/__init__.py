@@ -20,7 +20,7 @@ class ToolHub:
         if discord is not None and discord.bot_token and discord.guild_id:
             from ..discord_mcp import DiscordMCP
 
-            self.discord_mcp = DiscordMCP(discord)
+            self.discord_mcp = DiscordMCP(discord, memory=memory)
 
     def specs(self) -> list[dict]:
         tools = self.discord_mcp.specs() if self.discord_mcp else []

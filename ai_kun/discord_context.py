@@ -10,3 +10,4 @@ class DiscordContext:
     reply_to_message_id: str | None = None
     messages: tuple[Mapping[str, object], ...] = ()
     stop_reason: str | None = None
+    author_id: str | None = None

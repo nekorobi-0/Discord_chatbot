@@ -261,17 +261,34 @@ class AIKunClient(discord.Client):
         @app_commands.describe(question="質問内容")
         async def ask(interaction: discord.Interaction, question: str):
             async def operation():
-                return (await self.service.generate_reply(question, channel_id=interaction.channel_id)).content
+                user = getattr(interaction, "user", None)
+                context = DiscordContext(author_id=str(user.id)) if user is not None else None
+                return (
+                    await self.service.generate_reply(
+                        question,
+                        channel_id=interaction.channel_id,
+                        discord_context=context,
+                    )
+                ).content
 
             await self._answer(interaction, operation)
 
         @self.tree.command(name="search_memory", description="保存記憶を検索して管理者にだけ表示する")
         @app_commands.default_permissions(manage_guild=True)
         @app_commands.checks.has_permissions(manage_guild=True)
-        @app_commands.describe(query="検索語")
-        async def search_memory(interaction: discord.Interaction, query: str):
+        @app_commands.describe(query="検索語", user="発言した人で絞る", channel="発言先チャンネルで絞る")
+        async def search_memory(
+            interaction: discord.Interaction,
+            query: str,
+            user: discord.User | None = None,
+            channel: discord.TextChannel | None = None,
+        ):
             async def operation():
-                items = await self.service.search_memory(query)
+                items = await self.service.search_memory(
+                    query,
+                    user_id=user.id if user else None,
+                    channel_id=channel.id if channel else None,
+                )
                 if not items:
                     return "条件に合う記憶は見つからなかったよ。"
                 return "\n\n".join(f"〔{item.label}〕\n{item.text}" for item in items)

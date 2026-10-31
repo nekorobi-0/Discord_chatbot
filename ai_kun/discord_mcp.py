@@ -31,6 +31,25 @@ _ID = {"type": "string", "pattern": "^[0-9]{5,25}$"}
 _MAX_RESULT_CHARS = 24_000
 DISCORD_TOOLS = [
     Tool(
+        name="discord_search_memory",
+        description=(
+            "保存済みDiscord発言をRAG検索する。過去の話題・人物の発言・特定チャンネルの話はまずこのツールで調べる。"
+            "user_idとchannel_idは任意のAND条件。名前はdiscord_search_usersでIDを確認し、推測しない。"
+            "ユーザー指定時はその人の本文だけを返す。保存済み範囲だけの検索であり、未保存分はDiscord読み取りツールで補う。"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "minLength": 1, "maxLength": 500},
+                "user_id": _ID,
+                "channel_id": _ID,
+                "top_k": {"type": "integer", "minimum": 1, "maximum": 24, "default": 5},
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
         name="discord_resolve_users",
         description="設定サーバーでキャッシュ済みのユーザーIDから表示名を引く。ネットワーク取得しない。IDやmember-<ID>は回答に出さず名前を使う。未解決なら名前を推測しない。",
         inputSchema={
@@ -140,10 +159,11 @@ def paged_items(rows: list[dict], arguments: dict, key: str) -> dict:
 
 
 class DiscordReader:
-    def __init__(self, settings: DiscordSettings, *, api=None, image_transport=None, clock=time.monotonic):
+    def __init__(self, settings: DiscordSettings, *, api=None, memory=None, image_transport=None, clock=time.monotonic):
         init_db()
         self.settings = settings
         self.api = api
+        self.memory = memory
         self.image_transport = image_transport
         self.clock = clock
         self._channels = {}
@@ -267,6 +287,40 @@ class DiscordReader:
     async def read(self, name: str, arguments: dict) -> dict:
         if name not in {tool.name for tool in DISCORD_TOOLS}:
             raise InvalidInputError("このMCPはDiscordの読み取り専用です。その操作はありません。")
+        if name == "discord_search_memory":
+            query, top_k = arguments.get("query"), arguments.get("top_k", 5)
+            if not isinstance(query, str) or not 1 <= len(query.strip()) <= 500:
+                raise InvalidInputError("検索語は1〜500文字で指定してください。")
+            if isinstance(top_k, bool) or not isinstance(top_k, int) or not 1 <= top_k <= 24:
+                raise InvalidInputError("top_kは1〜24で指定してください。")
+            filters = {key: snowflake(arguments[key]) for key in ("user_id", "channel_id") if key in arguments}
+            if self.memory is None:
+                # stdioでもEmbedding設定だけでDBを検索できる。Chat APIは使わない。
+                from .config import ASRSettings, EmbeddingSettings, LLMSettings, MemorySettings
+                from .memory import MemoryStore
+
+                embedding = EmbeddingSettings.from_env()
+                self.memory = MemoryStore(
+                    embedding,
+                    LLMSettings(base_url=embedding.base_url, model=embedding.model),
+                    ASRSettings(),
+                    MemorySettings.from_env(),
+                )
+            hits = await self.memory.search(query, top_k=top_k, guild_id=self.settings.guild_id, **filters)
+            results = []
+            remaining = 20_000
+            for hit in hits:
+                excerpt = hit.text[: min(remaining, 8000)]
+                if not excerpt:
+                    break
+                results.append({"label": hit.label, "text": excerpt, "truncated": excerpt != hit.text})
+                remaining -= len(excerpt)
+            return {
+                "source": "saved_discord_memory",
+                "filters": filters,
+                "returned_count": len(results),
+                "results": results,
+            }
         if name == "discord_resolve_users":
             values = arguments.get("user_ids")
             if not isinstance(values, list) or not 1 <= len(values) <= 100:
@@ -397,8 +451,8 @@ async def memory_session(server: Server):
 
 
 class DiscordMCP:
-    def __init__(self, settings: DiscordSettings, *, reader: DiscordReader | None = None):
-        self.server = create_server(reader or DiscordReader(settings))
+    def __init__(self, settings: DiscordSettings, *, reader: DiscordReader | None = None, memory=None):
+        self.server = create_server(reader or DiscordReader(settings, memory=memory))
 
     def specs(self) -> list[dict]:
         return [

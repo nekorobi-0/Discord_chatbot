@@ -85,3 +85,13 @@ class HistoryMessageRecord(SQLModel, table=True):
     guild_id: str
     channel_id: str = Field(index=True)
     document_id: str | None = Field(default=None, index=True)
+
+
+class HistoryMessageSpanRecord(SQLModel, table=True):
+    """会話をまとめた文書内の、各発言の作者と範囲。"""
+
+    message_id: str = Field(primary_key=True)
+    document_id: str = Field(index=True, foreign_key="memorydocumentrecord.document_id", ondelete="CASCADE")
+    author_id: str = Field(index=True)
+    start: int
+    end: int

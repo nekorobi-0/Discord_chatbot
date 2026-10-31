@@ -33,6 +33,7 @@ from .db import (
     EmbeddingCacheRecord,
     HistoryCursorRecord,
     HistoryMessageRecord,
+    HistoryMessageSpanRecord,
     MemoryChunkRecord,
     MemoryDocumentRecord,
     get_engine,
@@ -51,6 +52,7 @@ DOCUMENT_EXTENSIONS = frozenset({".txt", ".md", ".markdown", ".log", ".csv", ".j
 VOICE_EXTENSIONS = frozenset({".ogg", ".mp4", ".webm", ".mkv", ".mp3", ".wav", ".m4a", ".aac", ".flac", ".opus"})
 _CHUNK_MARKER_RE = re.compile(r"^\s*\[\[\d{1,3}/\d{1,3}\]\]\s*$", re.MULTILINE)
 _CONTROL_CHARS_RE = re.compile(r"[^\S\n\r\t\u00a0-\u1680\u2000-\u2fff]+")
+_HISTORY_HEADER = re.compile(r"(?m)^\[\d{4}-\d{2}-\d{2}T[^\]\n]+\] member-([0-9]{5,25}): ")
 
 
 @dataclass(frozen=True)
@@ -546,6 +548,9 @@ class MemoryStore:
 
         # Embedding失敗時にはここへ到達しないため、カーソルも進まず同じページから再開できる。
         now = datetime.now(UTC)
+        authors = {}
+        for message in messages:
+            authors.setdefault(str(message["id"]), str((message.get("author") or {}).get("id", "")))
         with Session(get_engine()) as session:
             for document_id, text, group, pieces, vectors in prepared:
                 session.add(
@@ -572,7 +577,8 @@ class MemoryStore:
                             created_at=now,
                         )
                     )
-                for message_id, _ in group:
+                start = 0
+                for message_id, line in group:
                     session.add(
                         HistoryMessageRecord(
                             message_id=message_id,
@@ -581,6 +587,16 @@ class MemoryStore:
                             document_id=document_id,
                         )
                     )
+                    session.add(
+                        HistoryMessageSpanRecord(
+                            message_id=message_id,
+                            document_id=document_id,
+                            author_id=authors[message_id],
+                            start=start,
+                            end=start + len(line),
+                        )
+                    )
+                    start += len(line) + 1
             for message_id in skipped:
                 session.add(
                     HistoryMessageRecord(message_id=message_id, guild_id=str(guild_id), channel_id=str(channel_id))
@@ -601,34 +617,130 @@ class MemoryStore:
             "documents": len(groups),
         }
 
-    async def search(self, query: str, top_k: int | None = None) -> tuple[RetrievedChunk, ...]:
-        """保存済み埋め込みに対する近傍検索。NumPy のバッチ演算でスコアを一括計算する。
+    def _ensure_history_spans(self, scoped_documents):
+        """旧文書の作者範囲だけを補完する。本文やEmbeddingは変更しない。"""
+        cursor = ""
+        while True:
+            with Session(get_engine()) as session:
+                batch = session.exec(
+                    select(MemoryDocumentRecord)
+                    .where(
+                        MemoryDocumentRecord.document_id.in_(scoped_documents),
+                        MemoryDocumentRecord.document_id.not_in(select(HistoryMessageSpanRecord.document_id)),
+                        MemoryDocumentRecord.document_id > cursor,
+                    )
+                    .order_by(MemoryDocumentRecord.document_id)
+                    .limit(128)
+                ).all()
+                if not batch:
+                    break
+                records = session.exec(
+                    select(HistoryMessageRecord).where(
+                        HistoryMessageRecord.document_id.in_([doc.document_id for doc in batch])
+                    )
+                ).all()
+                by_document = {}
+                for record in records:
+                    by_document.setdefault(record.document_id, []).append(record)
+                values = []
+                for doc in batch:
+                    messages = sorted(by_document.get(doc.document_id, []), key=lambda item: int(item.message_id))
+                    headers = list(_HISTORY_HEADER.finditer(doc.content))
+                    # 一対一対応を確認できない旧文書は推測で作者を割り当てない。
+                    if not headers or headers[0].start() != 0 or len(headers) != len(messages):
+                        logger.warning("legacy history author metadata unavailable: document=%s", doc.document_id)
+                        continue
+                    for index, (record, header) in enumerate(zip(messages, headers, strict=True)):
+                        values.append(
+                            {
+                                "message_id": record.message_id,
+                                "document_id": doc.document_id,
+                                "author_id": header[1],
+                                "start": header.start(),
+                                "end": headers[index + 1].start() if index + 1 < len(headers) else len(doc.content),
+                            }
+                        )
+                if values:
+                    # executemanyでSQLiteの変数数制限を超えない。並行した補完とも競合しない。
+                    statement = sqlite_insert(HistoryMessageSpanRecord).on_conflict_do_nothing(
+                        index_elements=["message_id"]
+                    )
+                    session.execute(statement, values)
+                session.commit()
+                cursor = batch[-1].document_id
 
-        以前のような1件ずつの純Python演算や復号は行わない。スコア下限に満たない
-        チャンクは回答に渡さず、モデル・次元数が設定と違う記憶も対象にしない。
-        """
+    async def search(
+        self,
+        query: str,
+        top_k: int | None = None,
+        *,
+        guild_id: int | str | None = None,
+        channel_id: int | str | None = None,
+        user_id: int | str | None = None,
+    ) -> tuple[RetrievedChunk, ...]:
+        """メタデータで候補を絞ってから既存ベクトルを検索する。条件はAND。"""
         if not self._memory.enabled:
             return ()
+        if (channel_id is not None or user_id is not None) and guild_id is None:
+            raise InvalidInputError("条件付き検索にはサーバーIDが必要です。")
         text = _sanitize_text(query)
         if not text:
             return ()
-        limit = min(int(top_k or self._memory.top_k), 24)
+        limit = min(max(1, int(top_k or self._memory.top_k)), 24)
+        conditions = [
+            MemoryChunkRecord.model == self._embedding.model,
+            MemoryChunkRecord.dimension == self._embedding.dimension,
+        ]
+        if guild_id is not None:
+            scoped = select(HistoryMessageRecord.document_id).where(HistoryMessageRecord.guild_id == str(guild_id))
+            if channel_id is not None:
+                scoped = scoped.where(HistoryMessageRecord.channel_id == str(channel_id))
+            conditions.append(MemoryChunkRecord.document_id.in_(scoped))
+            if user_id is not None:
+                await asyncio.to_thread(self._ensure_history_spans, scoped)
+                conditions.append(
+                    MemoryChunkRecord.document_id.in_(
+                        select(HistoryMessageSpanRecord.document_id).where(
+                            HistoryMessageSpanRecord.author_id == str(user_id)
+                        )
+                    )
+                )
         with Session(get_engine()) as session:
             rows = list(
                 session.exec(
-                    select(MemoryChunkRecord).where(
-                        MemoryChunkRecord.model == self._embedding.model,
-                        MemoryChunkRecord.dimension == self._embedding.dimension,
+                    select(MemoryChunkRecord, MemoryDocumentRecord)
+                    .join(
+                        MemoryDocumentRecord,
+                        MemoryDocumentRecord.document_id == MemoryChunkRecord.document_id,
                     )
+                    .where(*conditions)
                 ).all()
             )
-        if not rows:
+            spans = {}
+            if user_id is not None:
+                for span in session.exec(
+                    select(HistoryMessageSpanRecord).where(
+                        HistoryMessageSpanRecord.author_id == str(user_id),
+                        HistoryMessageSpanRecord.document_id.in_(
+                            select(MemoryChunkRecord.document_id).where(*conditions)
+                        ),
+                    )
+                ):
+                    spans.setdefault(span.document_id, []).append(span)
+        candidates = []
+        for row, document in rows:
+            if user_id is None:
+                candidates.append((row, row.content, None))
+            else:
+                fragment, message_id = _author_fragment(document.content, row.content, spans.get(row.document_id, []))
+                if fragment:
+                    candidates.append((row, fragment, message_id))
+        if not candidates:
             return ()
-
         query_vector = (await self.embed([text]))[0]
-        matrix = np.empty((len(rows), self._embedding.dimension), dtype=np.float32)
-        usable = np.zeros(len(rows), dtype=bool)
-        for index, row in enumerate(rows):
+        matrix = np.empty((len(candidates), self._embedding.dimension), dtype=np.float32)
+        usable = np.zeros(len(candidates), dtype=bool)
+        for index, (row, _, _) in enumerate(candidates):
             vector = _decode_vector(row.embedding, self._embedding.dimension)
             if vector is None:
                 logger.warning("stored memory entry unreadable")
@@ -637,24 +749,29 @@ class MemoryStore:
             usable[index] = True
         if not usable.any():
             return ()
-
         scores = _batched_cosine(query_vector, matrix[usable])
-        eligible = np.flatnonzero(usable)[np.asarray(scores, dtype=np.float32) >= self._memory.min_score]
-        if eligible.size == 0:
-            return ()
-        ranked = eligible[np.argsort(-scores[eligible], kind="stable")][:limit]
-
-        results: list[RetrievedChunk] = []
-        for position in ranked.tolist():
-            row = rows[int(position)]
+        positions = np.flatnonzero(usable)
+        ranked = np.argsort(-scores, kind="stable")
+        results = []
+        seen = set()
+        for score_index in ranked.tolist():
+            if scores[score_index] < self._memory.min_score:
+                continue
+            row, fragment, message_id = candidates[int(positions[score_index])]
+            if (row.document_id, fragment) in seen:
+                continue
+            seen.add((row.document_id, fragment))
             with Session(get_engine()) as session:
-                origin = session.exec(
-                    select(HistoryMessageRecord).where(HistoryMessageRecord.document_id == row.document_id)
-                ).first()
+                origin_query = select(HistoryMessageRecord).where(HistoryMessageRecord.document_id == row.document_id)
+                if message_id is not None:
+                    origin_query = origin_query.where(HistoryMessageRecord.message_id == message_id)
+                origin = session.exec(origin_query).first()
             label = f"document:{row.document_id}"
             if origin:
                 label += f" https://discord.com/channels/{origin.guild_id}/{origin.channel_id}/{origin.message_id}"
-            results.append(RetrievedChunk(label=label, text=row.content))
+            results.append(RetrievedChunk(label=label, text=fragment))
+            if len(results) >= limit:
+                break
         return tuple(results)
 
     async def delete_document(self, document_id: str) -> int:
@@ -712,3 +829,24 @@ def _batched_cosine(query: Sequence[float], stored: np.ndarray) -> np.ndarray:
     normalized = stored / norms[:, None]
     scores = normalized @ (query_vector / query_norm)
     return np.where(np.isfinite(scores), scores, np.float32(0.0)).astype(np.float32, copy=False)
+
+
+def _author_fragment(document: str, chunk: str, spans) -> tuple[str, str | None]:
+    """一致する作者範囲との交差部分だけを返す。別人の本文を混ぜない。"""
+    if not chunk:
+        return "", None
+    fragments = []
+    message_id = None
+    offset = document.find(chunk)
+    while offset >= 0:
+        for span in sorted(spans, key=lambda item: item.start):
+            header = _HISTORY_HEADER.match(document, span.start)
+            start = max(offset, header.end() if header else span.start)
+            end = min(offset + len(chunk), span.end)
+            if start < end:
+                piece = document[start:end].strip()
+                if piece and piece not in fragments:
+                    fragments.append(piece)
+                    message_id = message_id or span.message_id
+        offset = document.find(chunk, offset + 1)
+    return "\n".join(fragments), message_id

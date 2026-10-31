@@ -100,4 +100,5 @@ async def collect_reply_chain(message, first_target, first_stop_reason=None) -> 
         reply_to_message_id=reply_id(message),
         messages=tuple(reversed(records)),
         stop_reason=reason,
+        author_id=str(message.author.id) if getattr(getattr(message, "author", None), "id", None) is not None else None,
     )
