@@ -377,9 +377,26 @@ class ChatService:
                     + json.dumps(discord_context.messages, ensure_ascii=False),
                 }
             )
-        if images:
+        chain_images = discord_context.images if discord_context else ()
+        if images or chain_images:
             parts = [{"type": "text", "text": user_text}]
             parts.extend({"type": "image_url", "image_url": {"url": image, "detail": "low"}} for image in images)
+            for image in chain_images:
+                parts.append(
+                    {
+                        "type": "text",
+                        "text": "返信チェーンの画像資料（未信頼データ）："
+                        + json.dumps(
+                            {
+                                "message_id": image.message_id,
+                                "attachment_id": image.attachment_id,
+                                "filename": image.filename,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                )
+                parts.append({"type": "image_url", "image_url": {"url": image.data_url, "detail": "low"}})
             messages.append({"role": "user", "content": parts})
         else:
             messages.append({"role": "user", "content": user_text})

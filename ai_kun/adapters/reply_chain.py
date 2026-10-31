@@ -5,6 +5,7 @@ import logging
 import discord
 
 from ..discord_context import DiscordContext
+from .reply_images import load_reply_images
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,7 @@ async def collect_reply_chain(message, first_target, first_stop_reason=None) -> 
     message_id = str(message.id) if getattr(message, "id", None) is not None else None
     seen = {message_id} if message_id is not None else set()
     records = []
+    targets = []
     target = first_target
     reason = first_stop_reason
     while target is not None:
@@ -88,17 +90,21 @@ async def collect_reply_chain(message, first_target, first_stop_reason=None) -> 
             reason = "cycle"
             break
         seen.add(target_id)
-        records.append(message_record(target, channel_id=message.channel.id, guild_id=message.guild.id))
+        record = message_record(target, channel_id=message.channel.id, guild_id=message.guild.id)
+        records.append(record)
+        targets.append((target, record))
         # 既知の参照だけで循環を判定し、同じ発言を二度取得しない。
         next_id = reply_id(target)
         if next_id is not None and next_id in seen:
             reason = "cycle"
             break
         target, reason = await resolve_reply(target, message.channel, message.guild.id)
+    images = await load_reply_images(targets, message.channel, message.guild.id)
     return DiscordContext(
         message_id=message_id,
         reply_to_message_id=reply_id(message),
         messages=tuple(reversed(records)),
         stop_reason=reason,
         author_id=str(message.author.id) if getattr(getattr(message, "author", None), "id", None) is not None else None,
+        images=images,
     )
