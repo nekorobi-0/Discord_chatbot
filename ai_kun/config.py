@@ -238,6 +238,9 @@ class SearchSettings:
     api_key: str = field(repr=False, default="")
     enabled: bool = True
     max_results: int = 5
+    exa_api_key: str = field(repr=False, default="")
+    fetch_enabled: bool = True
+    fetch_max_chars: int = 12000
 
     @classmethod
     def from_env(cls) -> SearchSettings:
@@ -245,11 +248,14 @@ class SearchSettings:
             api_key=_secret("TAVILY_API_KEY"),
             enabled=_bool("WEB_SEARCH_ENABLED", True),
             max_results=_int("WEB_SEARCH_MAX_RESULTS", 5, 1, 10),
+            exa_api_key=_secret("EXA_API_KEY"),
+            fetch_enabled=_bool("WEB_FETCH_ENABLED", True),
+            fetch_max_chars=_int("WEB_FETCH_MAX_CHARS", 12000, 500, 32000),
         )
 
     @property
     def configured(self) -> bool:
-        return bool(self.api_key)
+        return bool(self.exa_api_key or self.api_key)
 
 
 @dataclass(frozen=True)

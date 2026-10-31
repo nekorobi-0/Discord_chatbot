@@ -6,16 +6,13 @@ import logging
 import re
 import time
 from contextlib import asynccontextmanager
-from datetime import timedelta
 from pathlib import PurePosixPath
 from urllib.parse import urlparse
 
 import httpx
 from dotenv import load_dotenv
-from mcp import ClientSession
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.shared.memory import create_client_server_memory_streams
 from mcp.types import CallToolResult, ImageContent, TextContent, Tool, ToolAnnotations
 
 from .config import DiscordSettings
@@ -25,6 +22,7 @@ from .emoji_images import load_emoji_parts
 from .errors import AIKunError, InvalidInputError
 from .history import DiscordHistoryAPI, shared_limiter
 from .images import IMAGE_EXTENSIONS, image_data_url
+from .mcp_session import memory_session
 from .sticker_images import load_sticker_parts, sticker_record
 from .tool_result import ToolResult
 
@@ -461,19 +459,6 @@ def create_server(reader: DiscordReader) -> Server:
             )
 
     return server
-
-
-@asynccontextmanager
-async def memory_session(server: Server):
-    async with create_client_server_memory_streams() as (client_streams, server_streams):
-        task = asyncio.create_task(server.run(*server_streams, server.create_initialization_options()))
-        try:
-            async with ClientSession(*client_streams, read_timeout_seconds=timedelta(seconds=60)) as session:
-                await session.initialize()
-                yield session
-        finally:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
 
 
 class DiscordMCP:

@@ -363,3 +363,15 @@ def test_prose_and_code_output_limits_are_independent(monkeypatch):
     monkeypatch.setenv("MAX_CODE_TOKENS", "0")
     with pytest.raises(ConfigurationError):
         OperationalSettings.from_env()
+
+
+def test_exa_search_and_fetch_env(monkeypatch):
+    from ai_kun.config import SearchSettings
+
+    monkeypatch.setenv("EXA_API_KEY", "exa-test-secret")
+    monkeypatch.setenv("WEB_FETCH_ENABLED", "true")
+    monkeypatch.setenv("WEB_FETCH_MAX_CHARS", "9000")
+    configured = SearchSettings.from_env()
+    assert configured.exa_api_key == "exa-test-secret"
+    assert configured.configured and configured.fetch_enabled and configured.fetch_max_chars == 9000
+    assert "exa-test-secret" not in repr(configured)

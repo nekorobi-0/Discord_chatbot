@@ -153,11 +153,15 @@ docker compose up -d bot
 
 履歴APIの最大100件・ページング・権限の仕様は [Get Channel Messages](https://docs.discord.com/developers/resources/message#get-channel-messages) を参照しています。
 
-## Web検索（任意）
+## Web検索・URL本文取得MCP（任意）
 
-`TAVILY_API_KEY` を設定し、`WEB_SEARCH_ENABLED=true` にすると、LLMが必要に応じて `web_search` を呼びます。LLM側もChat Completionsのfunction callingに対応している必要があります。Web検索は質問に応じたモデルの判断であり、毎回必ず行うものではありません。キーがなければ通常の会話だけで動きます。
+`.env` に `EXA_API_KEY=...` を設定すると、LLMが必要に応じて `web_search` と `web_fetch` を呼べます。検索は [Exa Search API](https://exa.ai/docs/reference/search)、URLの本文取得は [Exa Contents API](https://exa.ai/docs/reference/get-contents) を使い、どちらも同じキーを利用します。Web fetchもExa経由のため、Exaの利用枠を消費します。キーは環境変数から読み、MCPの引数やLLMには渡しません。
 
-[Tavily Search API](https://docs.tavily.com/documentation/api-reference/endpoint/search)を利用します。検索結果に含まれるページをBot自身が追加取得する機能はありません。
+`WEB_SEARCH_ENABLED=true` で検索を、`WEB_FETCH_ENABLED=true` で本文取得を有効にします（両方既定で有効）。`WEB_SEARCH_MAX_RESULTS` は1〜10件、既定5件です。検索結果の抜粋は1件1500文字まで、`web_fetch` の本文は `WEB_FETCH_MAX_CHARS`（500〜32000文字、既定12000文字）まで渡し、省略時には `truncated` を付けます。本文取得は既知の公開HTTP/HTTPS URLを1件指定し、Exaへ都度の取得を要求します（`maxAgeHours=0`、クロール10秒・全体25秒の上限）。取得失敗はツールのエラーとして返し、推測で読めた扱いにしません。
+
+どちらも読み取り専用の実際のMCPサーバーとして、Bot内のメモリ転送で接続します。外部のMCPクライアントには `python -m ai_kun.web_mcp` をstdioで起動して利用できます。この起動方法ではDiscordやLLMの設定は不要です。HTTPポートは追加しません。検索結果・取得本文は未信頼データとして扱います。LLM側はChat Completionsのfunction callingに対応している必要があり、呼び出しは質問に応じたモデルの判断です。
+
+Exaを設定せず従来の `TAVILY_API_KEY` だけを設定した場合は、[Tavily Search API](https://docs.tavily.com/documentation/api-reference/endpoint/search)での検索を維持します。両方設定した場合はExaを優先し、Exaエラー時にTavilyへ自動で再送はしません。Exa未設定時は `web_fetch` を公開しません。キーがなければWebツールなしで会話できます。
 
 ## Discord読み取り専用MCP
 
