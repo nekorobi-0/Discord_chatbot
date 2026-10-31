@@ -475,7 +475,12 @@ class AIKunClient(discord.Client):
         text = content
         documents = []
         reply_kwargs = {"channel_id": channel_id}
-        if discord_context and (discord_context.message_id or discord_context.messages or discord_context.stop_reason):
+        if discord_context and (
+            discord_context.message_id
+            or discord_context.messages
+            or discord_context.stop_reason
+            or discord_context.stickers
+        ):
             reply_kwargs["discord_context"] = discord_context
         images = []
         notices = []
@@ -535,6 +540,8 @@ class AIKunClient(discord.Client):
                 text = "添付画像の内容を説明してください。"
             elif documents:
                 text = "添付資料の要点を短くまとめてください。"
+            elif discord_context and discord_context.stickers:
+                text = "今回のスタンプの内容を説明してください。取得できなかった画像の内容は推測しないでください。"
             elif discord_context and discord_context.messages:
                 text = "返信チェーンの発言と、取得できた画像を参照して、返信元の質問や依頼に答えてください。取得できなかった画像の内容は推測しないでください。"
         if text.strip():

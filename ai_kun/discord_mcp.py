@@ -25,6 +25,7 @@ from .emoji_images import load_emoji_parts
 from .errors import AIKunError, InvalidInputError
 from .history import DiscordHistoryAPI, shared_limiter
 from .images import IMAGE_EXTENSIONS, image_data_url
+from .sticker_images import load_sticker_parts, sticker_record
 from .tool_result import ToolResult
 
 logger = logging.getLogger(__name__)
@@ -205,6 +206,7 @@ class DiscordReader:
             "content": str(data.get("content") or "")[:4000],
             "timestamp": data.get("timestamp"),
             "reply_to_message_id": reference.get("message_id"),
+            "stickers": [sticker_record(item) for item in (data.get("sticker_items") or [])[:3]],
             "attachments": [
                 {
                     "filename": str(item.get("filename", ""))[:256],
@@ -230,7 +232,7 @@ class DiscordReader:
                     continue
                 selected.append((message["id"], attachment))
         if not selected:
-            return await self.emoji_contents(messages, max_images=4)
+            return await self.media_contents(messages, max_images=4)
         async with httpx.AsyncClient(timeout=8, follow_redirects=False, transport=self.image_transport) as client:
 
             async def fetch(message_id, attachment):
@@ -283,14 +285,20 @@ class DiscordReader:
                     return []
 
             results = await asyncio.gather(*(bounded_fetch(*item) for item in selected))
-        return [part for result in results for part in result] + await self.emoji_contents(
+        return [part for result in results for part in result] + await self.media_contents(
             messages, max_images=4 - len(selected)
         )
 
-    async def emoji_contents(self, messages, *, max_images):
-        parts = await load_emoji_parts(
-            [(message.get("id"), message.get("content", "")) for message in messages],
+    async def media_contents(self, messages, *, max_images):
+        parts = await load_sticker_parts(
+            [(message.get("id"), message.get("stickers", ())) for message in messages],
             max_images=max_images,
+            transport=self.image_transport,
+        )
+        remaining = max_images - sum(part["type"] == "image_url" for part in parts)
+        parts += await load_emoji_parts(
+            [(message.get("id"), message.get("content", "")) for message in messages],
+            max_images=remaining,
             transport=self.image_transport,
         )
         result = []

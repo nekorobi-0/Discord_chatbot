@@ -20,3 +20,4 @@ class DiscordContext:
     stop_reason: str | None = None
     author_id: str | None = None
     images: tuple[DiscordImage, ...] = ()
+    stickers: tuple[Mapping[str, object], ...] = ()

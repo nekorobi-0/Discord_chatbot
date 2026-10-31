@@ -5,6 +5,7 @@ import logging
 import discord
 
 from ..discord_context import DiscordContext
+from ..sticker_images import sticker_record
 from .reply_images import load_reply_images
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,7 @@ def message_record(message, *, channel_id: int, guild_id: int) -> dict:
         "author_is_bot": bool(getattr(author, "bot", False)),
         "timestamp": timestamp.isoformat() if timestamp is not None else None,
         "content": str(getattr(message, "content", "") or ""),
+        "stickers": [sticker_record(sticker) for sticker in getattr(message, "stickers", ())],
         "attachments": [
             {
                 "attachment_id": str(attachment.id) if getattr(attachment, "id", None) is not None else None,
@@ -107,4 +109,5 @@ async def collect_reply_chain(message, first_target, first_stop_reason=None) -> 
         stop_reason=reason,
         author_id=str(message.author.id) if getattr(getattr(message, "author", None), "id", None) is not None else None,
         images=images,
+        stickers=tuple(sticker_record(sticker) for sticker in getattr(message, "stickers", ())),
     )

@@ -25,6 +25,7 @@ from .ingestion import stored_status
 from .memory import MemoryStore
 from .observability import AuditLog, metrics
 from .request_diagnostics import phase
+from .sticker_images import load_sticker_parts
 from .streaming import TextUpdate, current_text_update
 from .text_files import FILE_TOKEN_LIMIT, FileText, limit_file_text
 from .tools import ToolHub
@@ -294,15 +295,23 @@ class ChatService:
         phase("build_context")
         if items:
             metrics.increment("ai_kun.memory_retrievals_total")
+        phase("sticker_images")
+        remaining_images = max(0, 8 - len(images) - len(discord_context.images if discord_context else ()))
+        sticker_sources = []
+        if discord_context:
+            sticker_sources.append((discord_context.message_id, discord_context.stickers))
+            sticker_sources.extend(
+                (item.get("message_id"), item.get("stickers", ())) for item in reversed(discord_context.messages)
+            )
+        sticker_parts = await load_sticker_parts(sticker_sources, max_images=remaining_images)
+        remaining_images -= sum(part["type"] == "image_url" for part in sticker_parts)
         phase("emoji_images")
         emoji_sources = [(discord_context.message_id if discord_context else None, raw)]
         if discord_context:
             emoji_sources.extend(
                 (item.get("message_id"), item.get("content", "")) for item in reversed(discord_context.messages)
             )
-        emoji_parts = await load_emoji_parts(
-            emoji_sources, max_images=max(0, 8 - len(images) - len(discord_context.images if discord_context else ()))
-        )
+        emoji_parts = await load_emoji_parts(emoji_sources, max_images=remaining_images)
         messages = self._build_messages(
             raw,
             (*documents, *items),
@@ -310,6 +319,7 @@ class ChatService:
             channel_id=channel_id,
             discord_context=discord_context,
             emoji_parts=emoji_parts,
+            sticker_parts=sticker_parts,
         )
 
         last_preview = 0.0
@@ -400,6 +410,7 @@ class ChatService:
         channel_id: int | None = None,
         discord_context: DiscordContext | None = None,
         emoji_parts: Sequence[dict] = (),
+        sticker_parts: Sequence[dict] = (),
     ) -> list[dict[str, object]]:
         prompt = SYSTEM_PROMPT
         prompt += f"\n設定済みDiscordサーバーID: {self._settings.discord.guild_id}"
@@ -433,7 +444,7 @@ class ChatService:
                 }
             )
         chain_images = discord_context.images if discord_context else ()
-        if images or chain_images or emoji_parts:
+        if images or chain_images or emoji_parts or sticker_parts:
             parts = [{"type": "text", "text": user_text}]
             parts.extend({"type": "image_url", "image_url": {"url": image, "detail": "low"}} for image in images)
             for image in chain_images:
@@ -452,6 +463,7 @@ class ChatService:
                     }
                 )
                 parts.append({"type": "image_url", "image_url": {"url": image.data_url, "detail": "low"}})
+            parts.extend(sticker_parts)
             parts.extend(emoji_parts)
             messages.append({"role": "user", "content": parts})
         else:
