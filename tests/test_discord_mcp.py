@@ -57,6 +57,8 @@ async def test_real_mcp_initialize_list_and_read_messages(settings):
             "discord_read_messages",
             "discord_get_message",
             "discord_list_active_threads",
+            "discord_resolve_users",
+            "discord_search_users",
         }
         assert all(tool.annotations.readOnlyHint and not tool.annotations.destructiveHint for tool in listed.tools)
         result = await session.call_tool("discord_read_messages", {"channel_id": "34567", "limit": 2})
@@ -133,7 +135,7 @@ async def test_discord_mcp_completes_llm_tool_round_trip(settings, store, monkey
 
 async def test_discord_tools_available_without_web_search(settings):
     hub = ToolHub(settings.search, discord=settings.discord)
-    assert len(hub.specs()) == 4
+    assert len(hub.specs()) == 6
     assert "error" in json.loads(await hub.execute("web_search", {"query": "test"}))
 
 
@@ -172,7 +174,7 @@ async def test_stdio_mcp_server_lists_tools_without_discord_network(settings):
         async with ClientSession(read, write) as session:
             await session.initialize()
             tools = await session.list_tools()
-            assert len(tools.tools) == 4
+            assert len(tools.tools) == 6
 
 
 async def test_reply_chain_message_id_can_drive_mcp_get_message(settings, store, monkeypatch):

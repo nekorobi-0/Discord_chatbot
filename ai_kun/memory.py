@@ -38,6 +38,7 @@ from .db import (
     get_engine,
     init_db,
 )
+from .discord_users import message_users, remember_users
 from .errors import InvalidInputError, RateLimitError, UpstreamError
 from .ingestion import IngestionMonitor
 from .request_diagnostics import phase, request_id
@@ -472,6 +473,7 @@ class MemoryStore:
             raise UpstreamError("記憶")
         if not messages:
             return {"scanned": 0, "imported": 0, "skipped": 0, "documents": 0}
+        remember_users(guild_id, message_users(messages))
         ids = [str(message["id"]) for message in messages]
         with Session(get_engine()) as session:
             seen = set(

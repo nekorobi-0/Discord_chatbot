@@ -70,6 +70,15 @@ class HistoryScanCursorRecord(SQLModel, table=True):
     last_message_id: str
 
 
+class DiscordUserRecord(SQLModel, table=True):
+    user_key: str = Field(primary_key=True)
+    guild_id: str = Field(index=True)
+    user_id: str
+    username: str = ""
+    global_name: str = ""
+    nickname: str | None = None
+
+
 class HistoryMessageRecord(SQLModel, table=True):
     # 削除した文書の対応も残し、再取り込みで復活させない。
     message_id: str = Field(primary_key=True)

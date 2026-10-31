@@ -13,6 +13,7 @@ from discord import app_commands
 from ..chat import ChatService, RetrievedItem
 from ..config import Settings
 from ..discord_context import DiscordContext
+from ..discord_users import public_user_names, remember_users, sdk_user
 from ..errors import AIKunError, InvalidInputError
 from ..images import IMAGE_EXTENSIONS, image_data_url
 from ..memory import DOCUMENT_EXTENSIONS, VOICE_EXTENSIONS
@@ -96,6 +97,12 @@ class AIKunClient(discord.Client):
     async def on_ready(self) -> None:
         logger.info("Discord connected; configured guild commands ready")
         metrics.increment("ai_kun.discord_connections_total")
+        guild = self.get_guild(self.settings.discord.guild_id)
+        members = getattr(guild, "members", ()) if guild else ()
+        if members:
+            await asyncio.to_thread(
+                remember_users, self.settings.discord.guild_id, [sdk_user(user) for user in members]
+            )
         if self.settings.memory.enabled and (self._history_loop_task is None or self._history_loop_task.done()):
             self._history_loop_task = asyncio.create_task(self._history_loop())
 
@@ -231,6 +238,7 @@ class AIKunClient(discord.Client):
         await interaction.response.defer(thinking=True, ephemeral=ephemeral)
         request_id = f"interaction-{getattr(interaction, 'id', 'unknown')}"
         result = await self._run(operation, request_id=request_id)
+        result = public_user_names(result, self.settings.discord.guild_id)
         try:
             logger.info("Discord followup started: request=%s", request_id)
             async with asyncio.timeout(DISCORD_IO_TIMEOUT_SECONDS):
@@ -393,6 +401,7 @@ class AIKunClient(discord.Client):
 
         request_id = str(getattr(message, "id", uuid.uuid4().hex[:12]))
         result = await self._run(operation, request_id=request_id)
+        result = public_user_names(result, self.settings.discord.guild_id)
         try:
             logger.info("Discord reply started: request=%s", request_id)
             async with asyncio.timeout(DISCORD_IO_TIMEOUT_SECONDS):

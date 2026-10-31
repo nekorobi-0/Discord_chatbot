@@ -19,6 +19,8 @@ from mcp.shared.memory import create_client_server_memory_streams
 from mcp.types import CallToolResult, ImageContent, TextContent, Tool, ToolAnnotations
 
 from .config import DiscordSettings
+from .db import init_db
+from .discord_users import message_users, remember_users, resolve_users, search_users
 from .errors import AIKunError, InvalidInputError
 from .history import DiscordHistoryAPI, shared_limiter
 from .images import IMAGE_EXTENSIONS, image_data_url
@@ -28,6 +30,31 @@ logger = logging.getLogger(__name__)
 _ID = {"type": "string", "pattern": "^[0-9]{5,25}$"}
 _MAX_RESULT_CHARS = 24_000
 DISCORD_TOOLS = [
+    Tool(
+        name="discord_resolve_users",
+        description="設定サーバーでキャッシュ済みのユーザーIDから表示名を引く。ネットワーク取得しない。IDやmember-<ID>は回答に出さず名前を使う。未解決なら名前を推測しない。",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "user_ids": {"type": "array", "items": _ID, "minItems": 1, "maxItems": 100},
+            },
+            "required": ["user_ids"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="discord_search_users",
+        description="設定サーバーのキャッシュ内で名前からユーザー候補をtop-k検索する。NFKC・大文字小文字を正規化し、長さの差も含むハミング距離で並べる。あいまいな候補を本人だと断定しない。返すIDは内部照合専用で回答には表示名を使う。",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "minLength": 1, "maxLength": 100},
+                "top_k": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    ),
     Tool(
         name="discord_list_channels",
         description="設定済みDiscordサーバーのチャンネル一覧を読む。チャンネル名からIDを調べるときに使う。",
@@ -114,6 +141,7 @@ def paged_items(rows: list[dict], arguments: dict, key: str) -> dict:
 
 class DiscordReader:
     def __init__(self, settings: DiscordSettings, *, api=None, image_transport=None, clock=time.monotonic):
+        init_db()
         self.settings = settings
         self.api = api
         self.image_transport = image_transport
@@ -239,6 +267,20 @@ class DiscordReader:
     async def read(self, name: str, arguments: dict) -> dict:
         if name not in {tool.name for tool in DISCORD_TOOLS}:
             raise InvalidInputError("このMCPはDiscordの読み取り専用です。その操作はありません。")
+        if name == "discord_resolve_users":
+            values = arguments.get("user_ids")
+            if not isinstance(values, list) or not 1 <= len(values) <= 100:
+                raise InvalidInputError("user_idsは1〜100件で指定してください。")
+            return await asyncio.to_thread(
+                resolve_users, self.settings.guild_id, [snowflake(value) for value in values]
+            )
+        if name == "discord_search_users":
+            query, top_k = arguments.get("query"), arguments.get("top_k", 5)
+            if not isinstance(query, str) or not 1 <= len(query.strip()) <= 100:
+                raise InvalidInputError("名前は1〜100文字で指定してください。")
+            if isinstance(top_k, bool) or not isinstance(top_k, int) or not 1 <= top_k <= 20:
+                raise InvalidInputError("top_kは1〜20で指定してください。")
+            return await asyncio.to_thread(search_users, self.settings.guild_id, query, top_k)
         async with self.connection() as api:
             if name == "discord_list_channels":
                 channels = await api.get(f"guilds/{self.settings.guild_id}/channels", expect_list=True)
@@ -272,6 +314,7 @@ class DiscordReader:
             if name == "discord_get_message":
                 message_id = snowflake(arguments.get("message_id"))
                 data = await api.get(f"channels/{channel_id}/messages/{message_id}")
+                remember_users(self.settings.guild_id, message_users([data]))
                 return {"message": self.message(data, channel_id)}
             limit = arguments.get("limit", 20)
             if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
@@ -285,6 +328,7 @@ class DiscordReader:
             if after is not None:
                 after = snowflake(after)
             data = await api.get(channel_id, messages=True, limit=limit, before=before, after=after)
+            remember_users(self.settings.guild_id, message_users(data[:limit]))
             messages = []
             for item in data[:limit]:
                 candidate = self.message(item, channel_id)
