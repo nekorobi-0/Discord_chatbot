@@ -27,6 +27,7 @@ from sqlalchemy import delete
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlmodel import Session, select
 
+from .chat_stream import read_chat_stream
 from .config import ASRSettings, EmbeddingSettings, LLMSettings, MemorySettings, _is_internal_host
 from .db import (
     EmbeddingCacheRecord,
@@ -44,6 +45,7 @@ from .file_types import DOCUMENT_EXTENSIONS as DOCUMENT_EXTENSIONS
 from .file_types import VOICE_EXTENSIONS, decode_text_file
 from .ingestion import IngestionMonitor
 from .request_diagnostics import phase, request_id
+from .streaming import TextUpdate
 from .work_queue import WorkQueue
 
 logger = logging.getLogger("ai_kun.memory")
@@ -117,7 +119,7 @@ class MemoryStore:
         """設定検証と同じ宛先ポリシーで判定する。"""
         return _is_internal_host(literal)
 
-    async def _request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
+    def _validate_upstream(self, url: str) -> str:
         base = None
         for candidate, suffix in (
             (self._llm.base_url, "/chat/completions"),
@@ -137,7 +139,10 @@ class MemoryStore:
         literal = (urlparse(base).hostname or "").lower()
         if target.scheme == "http" and _looks_like_literal(literal) and not self._is_internal_ip(literal):
             raise UpstreamError("外部サービス")
-        service = "LLM" if url.endswith("/chat/completions") else "Embedding"
+        return "LLM" if url.endswith("/chat/completions") else "Embedding"
+
+    async def _request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
+        service = self._validate_upstream(url)
         phase(f"{service.lower()}_http")
         started = time.monotonic()
         timeout = float(self._llm.timeout_seconds)
@@ -182,6 +187,7 @@ class MemoryStore:
         tools: Sequence[Mapping[str, object]] = (),
         temperature: float | None = None,
         max_tokens: int | None = None,
+        on_text: TextUpdate | None = None,
     ) -> ModelTurn:
         payload: dict[str, object] = {
             "model": self._llm.model,
@@ -193,18 +199,22 @@ class MemoryStore:
             payload["tools"] = list(tools)
             payload["tool_choice"] = "auto"
         headers = {"Authorization": f"Bearer {self._llm.api_key}"} if self._llm.api_key else {}
-        response = await self._request(
-            "POST", f"{self._llm.base_url.rstrip('/')}/chat/completions", json=payload, headers=headers
-        )
-        if response.status_code == 429:
-            raise RateLimitError()
-        if response.status_code >= 400:
-            logger.warning("llm http error: status=%s model=%s", response.status_code, self._llm.model)
-            raise UpstreamError(f"LLM HTTP {response.status_code} (model={self._llm.model})")
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise UpstreamError("おしゃべりの仕組み") from exc
+        if on_text is not None and self._llm.stream_enabled:
+            self._validate_upstream(f"{self._llm.base_url.rstrip('/')}/chat/completions")
+            data = await read_chat_stream(self._llm, payload, on_text)
+        else:
+            response = await self._request(
+                "POST", f"{self._llm.base_url.rstrip('/')}/chat/completions", json=payload, headers=headers
+            )
+            if response.status_code == 429:
+                raise RateLimitError()
+            if response.status_code >= 400:
+                logger.warning("llm http error: status=%s model=%s", response.status_code, self._llm.model)
+                raise UpstreamError(f"LLM HTTP {response.status_code} (model={self._llm.model})")
+            try:
+                data = response.json()
+            except ValueError as exc:
+                raise UpstreamError("おしゃべりの仕組み") from exc
         choices = data.get("choices") or []
         if not choices:
             raise UpstreamError("おしゃべりの仕組み")

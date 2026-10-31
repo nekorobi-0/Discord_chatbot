@@ -21,7 +21,7 @@ def reply_id(message) -> str | None:
     return str(value) if value is not None else None
 
 
-async def resolve_reply(message, channel, guild_id: int):
+async def resolve_reply(message, channel, guild_id: int, *, refresh=False):
     reference = getattr(message, "reference", None)
     if (
         reference is None
@@ -32,7 +32,7 @@ async def resolve_reply(message, channel, guild_id: int):
         return None, "outside_guild"
     if getattr(reference, "channel_id", channel.id) not in (None, channel.id):
         return None, "outside_channel"
-    target = getattr(reference, "resolved", None) or getattr(reference, "cached_message", None)
+    target = None if refresh else (getattr(reference, "resolved", None) or getattr(reference, "cached_message", None))
     if isinstance(target, discord.DeletedReferencedMessage):
         return None, "deleted"
     if target is None and getattr(reference, "message_id", None) is not None:

@@ -23,7 +23,9 @@ def client(settings, store, monkeypatch):
 
 
 async def test_only_running_request_types_and_timeout_does_not_block_next(client, monkeypatch, caplog):
-    monkeypatch.setattr("ai_kun.adapters.discord_bot.RESPONSE_TIMEOUT_SECONDS", 0.04)
+    client.settings = replace(
+        client.settings, operational=replace(client.settings.operational, request_timeout_seconds=0.04)
+    )
     monkeypatch.setattr("ai_kun.adapters.discord_bot.REQUEST_HEARTBEAT_SECONDS", 0.01)
     calls = 0
     entered = asyncio.Event()
@@ -93,7 +95,7 @@ async def test_broken_typing_does_not_prevent_answer(client, monkeypatch, caplog
 
 
 async def test_discord_reply_timeout_is_logged(client, monkeypatch, caplog):
-    monkeypatch.setattr("ai_kun.adapters.discord_bot.DISCORD_IO_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr("ai_kun.adapters.stream_reply.DISCORD_IO_TIMEOUT_SECONDS", 0.01)
     monkeypatch.setattr(client.service, "generate_reply", AsyncMock(return_value=SimpleNamespace(content="回答")))
     message = file_message("!ai 質問", [])
     message.reply = AsyncMock(side_effect=lambda *args, **kwargs: None)

@@ -330,3 +330,26 @@ def test_loopback_hostnames_are_accepted_without_resolution():
             assert LLMSettings.from_env().base_url == f"http://{host}:11434/v1"
     finally:
         monkeypatch.undo()
+
+
+async def test_streaming_defaults_and_explicit_legacy_configuration(monkeypatch):
+    monkeypatch.setenv("LLM_BASE_URL", "https://llm.example/v1")
+    monkeypatch.setenv("LLM_MODEL", "test")
+    for key in (
+        "LLM_STREAM_ENABLED",
+        "LLM_FIRST_TOKEN_TIMEOUT_SECONDS",
+        "LLM_STREAM_TIMEOUT_SECONDS",
+        "REQUEST_TIMEOUT_SECONDS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    llm = LLMSettings.from_env()
+    assert llm.stream_enabled is True
+    assert llm.first_token_timeout_seconds == 300
+    assert llm.stream_timeout_seconds == 900
+    assert OperationalSettings.from_env().request_timeout_seconds == 1200
+    monkeypatch.setenv("LLM_STREAM_ENABLED", "false")
+    monkeypatch.setenv("LLM_FIRST_TOKEN_TIMEOUT_SECONDS", "600")
+    monkeypatch.setenv("REQUEST_TIMEOUT_SECONDS", "1800")
+    assert LLMSettings.from_env().stream_enabled is False
+    assert LLMSettings.from_env().first_token_timeout_seconds == 600
+    assert OperationalSettings.from_env().request_timeout_seconds == 1800

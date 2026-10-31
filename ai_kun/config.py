@@ -170,6 +170,9 @@ class LLMSettings:
     temperature: float = 0.7
     max_tokens: int = 1024
     timeout_seconds: float = 90.0
+    first_token_timeout_seconds: float = 300.0
+    stream_timeout_seconds: float = 900.0
+    stream_enabled: bool = True
 
     @classmethod
     def from_env(cls) -> LLMSettings:
@@ -180,6 +183,9 @@ class LLMSettings:
             temperature=_float("LLM_TEMPERATURE", 0.7, 0.0, 2.0),
             max_tokens=_int("LLM_MAX_TOKENS", 1024, 64, 8192),
             timeout_seconds=_float("LLM_TIMEOUT_SECONDS", 90.0, 5.0, 300.0),
+            first_token_timeout_seconds=_float("LLM_FIRST_TOKEN_TIMEOUT_SECONDS", 300.0, 5.0, 1800.0),
+            stream_timeout_seconds=_float("LLM_STREAM_TIMEOUT_SECONDS", 900.0, 30.0, 3600.0),
+            stream_enabled=_bool("LLM_STREAM_ENABLED", True),
         )
 
 
@@ -280,6 +286,7 @@ class OperationalSettings:
     http_enabled: bool = True
     http_host: str = "0.0.0.0"
     http_port: int = 8080
+    request_timeout_seconds: float = 1200.0
 
     @classmethod
     def from_env(cls) -> OperationalSettings:
@@ -289,6 +296,7 @@ class OperationalSettings:
             http_enabled=_bool("HTTP_ENABLED", True),
             http_host=_raw("HTTP_HOST") or "0.0.0.0",
             http_port=_int("HTTP_PORT", 8080, 1, 65535),
+            request_timeout_seconds=_float("REQUEST_TIMEOUT_SECONDS", 1200.0, 30.0, 7200.0),
         )
 
 

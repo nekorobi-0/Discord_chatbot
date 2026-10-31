@@ -23,6 +23,7 @@ from .ingestion import stored_status
 from .memory import MemoryStore
 from .observability import AuditLog, metrics
 from .request_diagnostics import phase
+from .streaming import TextUpdate, current_text_update
 from .text_files import FILE_TOKEN_LIMIT, FileText, limit_file_text
 from .tools import ToolHub
 from .work_queue import MessageQueue, WorkQueue
@@ -31,6 +32,7 @@ logger = logging.getLogger("ai_kun.chat")
 
 MAX_INPUT_CHARS = 8_000
 MAX_TOOL_ROUNDS = 4
+STREAM_PREVIEW_INTERVAL_SECONDS = 0.5
 SYSTEM_PROMPT = (
     "あなたは AIくん。Discord のサーバーで仲間と遊ぶ、ノンデリで倫理観なしのキャラクターのおしゃべりAIです。\n"
     "- 日本語で、くだけた短い口調で答える。長い説明は要点を先に、あとから補足。\n"
@@ -250,11 +252,17 @@ class ChatService:
         images: Sequence[str] = (),
         channel_id: int | None = None,
         discord_context: DiscordContext | None = None,
+        on_update: TextUpdate | None = None,
     ) -> ChatResult:
         phase("reply_lock")
         async with self._reply_lock:
             return await self._generate_reply(
-                content, documents=documents, images=images, channel_id=channel_id, discord_context=discord_context
+                content,
+                documents=documents,
+                images=images,
+                channel_id=channel_id,
+                discord_context=discord_context,
+                on_update=on_update or current_text_update.get(),
             )
 
     async def _generate_reply(
@@ -265,6 +273,7 @@ class ChatService:
         images: Sequence[str] = (),
         channel_id: int | None = None,
         discord_context: DiscordContext | None = None,
+        on_update: TextUpdate | None = None,
     ) -> ChatResult:
         """RAG を経由したうえで、1 往復の応答を返す。履歴は一切残さない。"""
         started = time.monotonic()
@@ -285,7 +294,25 @@ class ChatService:
             raw, (*documents, *items), images=images, channel_id=channel_id, discord_context=discord_context
         )
 
-        content_text = _without_unsolicited_discord_footer(await self._run_tool_loop(messages), raw)
+        last_preview = 0.0
+
+        async def preview(snapshot: str):
+            nonlocal last_preview
+            now = time.monotonic()
+            if now - last_preview < STREAM_PREVIEW_INTERVAL_SECONDS:
+                return
+            last_preview = now
+            # 未完のID・メンションを表示しないよう、末尾の語を保留する。
+            boundary = max((match.end() for match in re.finditer(r"[\s、。，．！？!?;；:：]", snapshot)), default=0)
+            visible = _without_unsolicited_discord_footer(snapshot[:boundary], raw, streaming=True)
+            visible = public_user_names(visible, self._settings.discord.guild_id, sources=messages)
+            await on_update(visible[: self._settings.operational.max_output_chars])
+
+        if on_update is not None:
+            generated = await self._run_tool_loop(messages, on_text=preview)
+        else:
+            generated = await self._run_tool_loop(messages)
+        content_text = _without_unsolicited_discord_footer(generated, raw)
         content_text = public_user_names(content_text, self._settings.discord.guild_id, sources=messages)
         truncated = len(content_text) > self._settings.operational.max_output_chars
         if truncated:
@@ -402,7 +429,7 @@ class ChatService:
             messages.append({"role": "user", "content": user_text})
         return messages
 
-    async def _run_tool_loop(self, messages: list[dict[str, object]]) -> str:
+    async def _run_tool_loop(self, messages: list[dict[str, object]], *, on_text: TextUpdate | None = None) -> str:
         tool_specs = self._tools.specs()
         image_count = 0
         image_bytes = 0
@@ -415,6 +442,7 @@ class ChatService:
                     tools=tool_specs,
                     temperature=self._settings.llm.temperature,
                     max_tokens=self._settings.llm.max_tokens,
+                    **({"on_text": on_text} if on_text is not None else {}),
                 )
                 logger.info(
                     "LLM response: round=%d seconds=%.3f tool_calls=%d",
@@ -469,7 +497,7 @@ class ChatService:
         raise UpstreamError("おしゃべりの仕組み")
 
 
-def _without_unsolicited_discord_footer(content: str, user_text: str) -> str:
+def _without_unsolicited_discord_footer(content: str, user_text: str, *, streaming: bool = False) -> str:
     sources_declined = re.search(
         r"(?:リンク|url|出典|ソース)[^。！？\n]{0,20}(?:いらない|いらん|不要|なし|出さない|付けない|載せない)",
         user_text,
@@ -482,7 +510,9 @@ def _without_unsolicited_discord_footer(content: str, user_text: str) -> str:
     header = re.search(
         r"(?im)^\s*(?:#{1,6}\s*)?(?:\*\*)?(?:根拠データ|参照メッセージ|参照したメッセージ)(?:\*\*)?\s*[：:]", content
     )
-    if header and re.search(r"https?://(?:\w+\.)?discord(?:app)?\.com/channels/", content[header.start() :]):
+    if header and (
+        streaming or re.search(r"https?://(?:\w+\.)?discord(?:app)?\.com/channels/", content[header.start() :])
+    ):
         return content[: header.start()].rstrip()
     return content
 

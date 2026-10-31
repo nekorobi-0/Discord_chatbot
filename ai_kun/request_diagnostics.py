@@ -10,6 +10,7 @@ class RequestTrace:
     request_id: str
     phase: str = "queued"
     accepted_at: float = field(default_factory=time.monotonic)
+    failed: bool = False
 
 
 current_trace: ContextVar[RequestTrace | None] = ContextVar("request_trace", default=None)
