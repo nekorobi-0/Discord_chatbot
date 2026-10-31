@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import httpx
 from sqlmodel import Session
 
-from .db import HistoryCursorRecord, data_dir, get_engine
+from .db import HistoryScanCursorRecord, data_dir, get_engine
 from .errors import ConfigurationError, UpstreamError
 
 logger = logging.getLogger(__name__)
@@ -54,13 +54,12 @@ def number(value, default=0.0) -> float:
 class Bucket:
     next_at: float = 0
     reset_at: float = 0
-    window: float = 0
-    used: int = 0
     limit: int = 1
+    remaining: int | None = None
 
 
-class HalfRateLimiter:
-    """既知bucketの約半分以下。未知bucketは2秒間隔でプローブする。"""
+class DiscordRateLimiter:
+    """全体50req/s以内で、bucketの残り枠・リセット・429に従う。"""
 
     def __init__(self, clock=time.monotonic, sleep=interruptible_sleep):
         self.clock = clock
@@ -68,13 +67,27 @@ class HalfRateLimiter:
         self.routes: dict[tuple[str, str], tuple[str, str]] = {}
         self.buckets: dict[tuple[str, str], Bucket] = {}
         self.global_next = 0.0
+        self._reservation_lock = asyncio.Lock()
 
     async def wait(self, route: str, major: str) -> None:
-        key = self.routes.get((route, major), (route, major))
-        bucket = self.buckets.get(key)
-        deadline = max(self.global_next, bucket.next_at if bucket else 0)
-        await self.sleep(max(0.0, deadline - self.clock()))
-        self.global_next = self.clock() + 1 / 25  # 公式のglobal 50req/sに対して50%。
+        while True:
+            async with self._reservation_lock:
+                now = self.clock()
+                key = self.routes.get((route, major), (route, major))
+                bucket = self.buckets.get(key)
+                if bucket and bucket.remaining is not None and now >= bucket.reset_at:
+                    bucket.remaining = bucket.limit
+                    bucket.reset_at = float("inf")  # 次の応答で実際のリセット時刻を更新。
+                deadline = max(self.global_next, bucket.next_at if bucket else 0)
+                if bucket and bucket.remaining == 0:
+                    deadline = max(deadline, bucket.reset_at + 0.05)
+                if deadline <= now:
+                    self.global_next = now + 1 / 50
+                    if bucket and bucket.remaining is not None:
+                        bucket.remaining -= 1
+                    return
+            # 待機中は他のbucketを止めず、起床後に予約状況を再確認する。
+            await self.sleep(deadline - now)
 
     def observe(self, route: str, major: str, headers: httpx.Headers) -> None:
         now = self.clock()
@@ -88,20 +101,15 @@ class HalfRateLimiter:
         if reset < 0:
             reset = max(0.0, number(headers.get("X-RateLimit-Reset")) - time.time())
         if not limit or reset <= 0:
-            # 上限不明のときはバーストしない。
-            bucket.next_at = now + max(2.0, bucket.window * 2 / bucket.limit)
-            # ヘッダー不明の待機は当該routeだけ。別チャンネルまで止めない。
+            # ヘッダーがないだけで人工的な2秒待機を足さない。429はdeferで扱う。
             return
-        if now >= bucket.reset_at or abs(bucket.reset_at - (now + reset)) > 0.5:
-            bucket.used = 0
+        new_window = bucket.remaining is None or (
+            bucket.reset_at != float("inf") and (now >= bucket.reset_at or abs(bucket.reset_at - (now + reset)) > 0.5)
+        )
         bucket.limit = max(1, int(limit))
-        bucket.window = max(bucket.window, reset)
         bucket.reset_at = now + reset
-        bucket.used += 1
-        bucket.next_at = now + max(1 / 25, 2 * bucket.window / bucket.limit)
-        half_allowance = max(1, bucket.limit // 2)
-        if bucket.used >= half_allowance or number(headers.get("X-RateLimit-Remaining"), 0) <= 0:
-            bucket.next_at = max(bucket.next_at, bucket.reset_at + 0.1)
+        remaining = int(number(headers.get("X-RateLimit-Remaining"), 0))
+        bucket.remaining = remaining if new_window or bucket.remaining is None else min(bucket.remaining, remaining)
 
     def defer(self, route: str, major: str, seconds: float, global_limit: bool) -> None:
         deadline = self.clock() + seconds + 0.1
@@ -113,14 +121,14 @@ class HalfRateLimiter:
 
 
 # 稼働中Botの自動取り込み（バックフィル）もこの共通制限器を共有する。
-shared_limiter = HalfRateLimiter()
+shared_limiter = DiscordRateLimiter()
 
 
 class DiscordHistoryAPI:
     def __init__(self, token: str, client: httpx.AsyncClient, limiter=None):
         self.client = client
         self.token = token
-        self.limiter = limiter or HalfRateLimiter()
+        self.limiter = limiter or DiscordRateLimiter()
 
     async def get(self, resource, *, messages=False, after=None, before=None, limit=100, expect_list=False):
         """チャンネルIDまたはDiscord APIパス（例: guilds/<id>/channels）へのGET。"""
@@ -198,18 +206,13 @@ class DiscordHistoryAPI:
 
 
 async def backfill_channel(settings, store, channel_id: int, *, api=None) -> dict[str, int]:
-    """保存済みカーソルから未保存分だけを、稼働中のBot内で自動追跡する。
-
-    取り込み済みメッセージIDとタイムスタンプはDBに記録済みで、Discord APIの
-    ページング結果（フック有無に関係なく観測できる）と比較すれば欠落を判定できる。
-    共通レート制限器越しに古い順へ巻き戻し、欠落を即座にRAG記憶へ取り込む。
-    """
+    """走査専用カーソルから古い順に読む。旧版のライブ観測位置は信用しない。"""
     totals = {"scanned": 0, "imported": 0, "skipped": 0, "documents": 0}
     key = f"{settings.discord.guild_id}:{channel_id}"
     # 自動バックフィルも単独実行だけ。二重起動はカーソルを進めず、取り込みを重複させない。
     with importer_lock():
         with Session(get_engine()) as session:
-            checkpoint = session.get(HistoryCursorRecord, key)
+            checkpoint = session.get(HistoryScanCursorRecord, key)
             cursor = int(checkpoint.last_message_id) if checkpoint else 0
         async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
             api = api or DiscordHistoryAPI(settings.discord.bot_token, client, shared_limiter)
@@ -227,6 +230,15 @@ async def backfill_channel(settings, store, channel_id: int, *, api=None) -> dic
                     break
                 result = await store.ingest_history_page(settings.discord.guild_id, channel_id, eligible)
                 cursor = int(eligible[-1]["id"])
+                # 保存に成功したページだけ確定。ライブ投入の最新IDは参照しない。
+                with Session(get_engine()) as session:
+                    checkpoint = session.get(HistoryScanCursorRecord, key)
+                    if checkpoint is None:
+                        checkpoint = HistoryScanCursorRecord(channel_key=key, last_message_id=str(cursor))
+                    else:
+                        checkpoint.last_message_id = str(cursor)
+                    session.add(checkpoint)
+                    session.commit()
                 for name in totals:
                     totals[name] += result[name]
                 logger.info(

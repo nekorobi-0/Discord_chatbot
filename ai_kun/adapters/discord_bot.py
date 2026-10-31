@@ -75,6 +75,8 @@ class AIKunClient(discord.Client):
         self._response_queue = WorkQueue()
         self._message_tasks: set[asyncio.Task] = set()
         self._history_tasks: set[asyncio.Task] = set()
+        self._history_task_channels: dict[asyncio.Task, int] = {}
+        self._history_loop_task: asyncio.Task | None = None
         self.tree = RestrictedTree(self)
         self._register_commands()
 
@@ -86,6 +88,29 @@ class AIKunClient(discord.Client):
     async def on_ready(self) -> None:
         logger.info("Discord connected; configured guild commands ready")
         metrics.increment("ai_kun.discord_connections_total")
+        if self.settings.memory.enabled and (self._history_loop_task is None or self._history_loop_task.done()):
+            self._history_loop_task = asyncio.create_task(self._history_loop())
+
+    async def _history_loop(self):
+        while not self.is_closed():
+            try:
+                self._sweep_history()
+            except Exception as exc:
+                logger.warning("history sweep failed: %s", type(exc).__name__)
+            await asyncio.sleep(60)
+
+    def _sweep_history(self):
+        guild = self.get_guild(self.settings.discord.guild_id)
+        if guild is None or guild.me is None:
+            return
+        pending = set(self._history_task_channels.values())
+        channels = {channel.id: channel for channel in [*guild.channels, *guild.threads]}
+        for channel in channels.values():
+            if not hasattr(channel, "history") or channel.id in pending:
+                continue
+            permissions = channel.permissions_for(guild.me)
+            if permissions.view_channel and permissions.read_message_history:
+                self._schedule_backfill(channel.id)
 
     async def _run(self, operation: Callable[[], Awaitable[str]]) -> str:
         return await self._response_queue.submit(lambda: self._execute(operation))
@@ -105,6 +130,9 @@ class AIKunClient(discord.Client):
             return "処理に失敗しました。管理者に設定の確認をお願いしてください。"
 
     async def drain(self):
+        if self._history_loop_task is not None:
+            self._history_loop_task.cancel()
+            await asyncio.gather(self._history_loop_task, return_exceptions=True)
         # 接続終了後も、受付済みメッセージから後続の取り込みがキューへ入るまで待つ。
         if self._message_tasks:
             await asyncio.gather(*self._message_tasks, return_exceptions=True)
@@ -184,9 +212,17 @@ class AIKunClient(discord.Client):
             self._message_tasks.discard(task)
 
     def _schedule_backfill(self, channel_id: int):
+        if not self.settings.memory.enabled:
+            return
         task = asyncio.create_task(self._run_backfill(channel_id))
         self._history_tasks.add(task)
-        task.add_done_callback(self._history_tasks.discard)
+        self._history_task_channels[task] = channel_id
+
+        def finished(task):
+            self._history_tasks.discard(task)
+            self._history_task_channels.pop(task, None)
+
+        task.add_done_callback(finished)
 
     async def _run_backfill(self, channel_id: int):
         try:

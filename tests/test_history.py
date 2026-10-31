@@ -6,7 +6,7 @@ from sqlmodel import Session, select
 
 from ai_kun.db import HistoryCursorRecord, HistoryMessageRecord, MemoryDocumentRecord, get_engine
 from ai_kun.errors import ConfigurationError, UpstreamError
-from ai_kun.history import DiscordHistoryAPI, HalfRateLimiter, importer_lock
+from ai_kun.history import DiscordHistoryAPI, DiscordRateLimiter, importer_lock
 
 
 class Clock:
@@ -33,68 +33,67 @@ def headers(limit=10, reset=10, remaining=9, bucket="messages"):
     )
 
 
-async def test_half_rate_spacing_and_bucket_allowance():
+async def test_uses_full_bucket_then_waits_for_reset():
     clock = Clock()
-    limiter = HalfRateLimiter(clock, clock.sleep)
+    limiter = DiscordRateLimiter(clock, clock.sleep)
     sent = []
-    for _ in range(6):
+    for index in range(11):
         await limiter.wait("messages", "123")
         sent.append(clock.now)
-        limiter.observe("messages", "123", headers(reset=10 - (clock.now % 10)))
-    assert sent == [0, 2, 4, 6, 8, 10.1]
-    # 十秒枠に10回ではなく5回。初回からバーストしない。
-    assert sum(t < 10 for t in sent) == 5
+        remaining = 9 - index if index < 10 else 9
+        limiter.observe("messages", "123", headers(reset=10 - (clock.now % 10), remaining=remaining))
+    assert sent[:10] == pytest.approx([i * 0.02 for i in range(10)])
+    assert sent[10] >= 10
 
 
-async def test_small_odd_bucket_stays_below_half():
+async def test_global_50rps_also_applies_to_unknown_routes():
     clock = Clock()
-    limiter = HalfRateLimiter(clock, clock.sleep)
+    limiter = DiscordRateLimiter(clock, clock.sleep)
     sent = []
-    for _ in range(3):
-        await limiter.wait("messages", "123")
+    for index in range(51):
+        await limiter.wait("messages", str(index))
         sent.append(clock.now)
-        limiter.observe("messages", "123", headers(limit=5, reset=10 - (clock.now % 10)))
-    assert sent == [0, 4, 10.1]
+    assert sent == pytest.approx([i * 0.02 for i in range(51)])
 
 
 async def test_remaining_zero_waits_for_reset():
     clock = Clock()
-    limiter = HalfRateLimiter(clock, clock.sleep)
+    limiter = DiscordRateLimiter(clock, clock.sleep)
     limiter.observe("messages", "1", headers(reset=30, remaining=0))
     await limiter.wait("messages", "1")
     assert clock.now >= 30
 
 
-async def test_single_request_bucket_skips_a_window():
+async def test_single_request_bucket_resumes_next_window():
     clock = Clock()
-    limiter = HalfRateLimiter(clock, clock.sleep)
+    limiter = DiscordRateLimiter(clock, clock.sleep)
     limiter.observe("messages", "1", headers(limit=1, reset=10, remaining=0))
     await limiter.wait("messages", "1")
-    assert clock.now == 20
+    assert clock.now == pytest.approx(10.05)
 
 
-async def test_unknown_headers_are_conservative():
+async def test_unknown_headers_do_not_invent_two_second_delay():
     clock = Clock()
-    limiter = HalfRateLimiter(clock, clock.sleep)
+    limiter = DiscordRateLimiter(clock, clock.sleep)
     limiter.observe("messages", "1", httpx.Headers())
     await limiter.wait("messages", "1")
-    assert clock.now >= 2
+    assert clock.now == 0
 
 
 async def test_bucket_identity_includes_channel():
     clock = Clock()
-    limiter = HalfRateLimiter(clock, clock.sleep)
+    limiter = DiscordRateLimiter(clock, clock.sleep)
     limiter.observe("messages", "1", headers(remaining=0))
     limiter.observe("messages", "2", headers())
     await limiter.wait("messages", "2")
-    assert clock.now == 2
+    assert clock.now == 0
     await limiter.wait("messages", "1")
     assert clock.now >= 10
 
 
 async def test_shared_bucket_and_global_retry_after():
     clock = Clock()
-    limiter = HalfRateLimiter(clock, clock.sleep)
+    limiter = DiscordRateLimiter(clock, clock.sleep)
     limiter.observe("first", "1", headers())
     limiter.observe("second", "1", headers())
     assert limiter.routes[("first", "1")] == limiter.routes[("second", "1")]
@@ -106,7 +105,7 @@ async def test_shared_bucket_and_global_retry_after():
 @pytest.mark.parametrize("global_limit", [True, False])
 async def test_429_waits_before_retry(global_limit):
     clock = Clock()
-    limiter = HalfRateLimiter(clock, clock.sleep)
+    limiter = DiscordRateLimiter(clock, clock.sleep)
     sent = []
 
     def handler(request):
@@ -136,7 +135,7 @@ async def test_invalid_permissions_do_not_retry(status):
 
     clock = Clock()
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        api = DiscordHistoryAPI("fake-token", client, HalfRateLimiter(clock, clock.sleep))
+        api = DiscordHistoryAPI("fake-token", client, DiscordRateLimiter(clock, clock.sleep))
         with pytest.raises(ConfigurationError, match=str(status)):
             await api.get(34567)
     assert len(calls) == 1
@@ -151,7 +150,7 @@ async def test_retry_is_bounded():
         return httpx.Response(503)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        api = DiscordHistoryAPI("fake-token", client, HalfRateLimiter(clock, clock.sleep))
+        api = DiscordHistoryAPI("fake-token", client, DiscordRateLimiter(clock, clock.sleep))
         with pytest.raises(UpstreamError):
             await api.get(34567)
     assert len(calls) == 5
@@ -348,18 +347,18 @@ async def test_duplicate_ids_inside_one_page_are_saved_once(embedded):
 
 async def test_unknown_bucket_does_not_delay_unrelated_routes():
     clock = Clock()
-    limiter = HalfRateLimiter(clock, clock.sleep)
+    limiter = DiscordRateLimiter(clock, clock.sleep)
     await limiter.wait("resource", "123")
     limiter.observe("resource", "123", httpx.Headers())
     await limiter.wait("messages", "456")
-    assert clock.now == pytest.approx(0.04)  # 修正前は2秒。
+    assert clock.now == pytest.approx(0.02)  # 修正前は2秒。
     await limiter.wait("resource", "123")
-    assert clock.now == pytest.approx(2)  # 元のrouteは従来どおり待つ。
+    assert clock.now == pytest.approx(0.04)  # 同じrouteにも人工的な2秒待機を足さない。
 
 
 async def test_single_message_ids_share_channel_bucket():
     clock = Clock()
-    limiter = HalfRateLimiter(clock, clock.sleep)
+    limiter = DiscordRateLimiter(clock, clock.sleep)
     times = []
 
     def handler(request):
@@ -370,4 +369,48 @@ async def test_single_message_ids_share_channel_bucket():
         api = DiscordHistoryAPI("fake", client, limiter)
         await api.get("channels/12345/messages/50001")
         await api.get("channels/12345/messages/50002")
-    assert times == [0, 2]
+    assert times == [0, 0.02]
+
+
+async def test_live_latest_and_legacy_checkpoint_cannot_skip_old_history(settings, embedded):
+    from ai_kun.chat import ChatService
+    from ai_kun.db import HistoryScanCursorRecord
+
+    # 既存バージョンが最新位置を記録済みでも、新しい走査位置に流用しない。
+    await embedded.ingest_history_page(23456, 34567, [message(203)])
+    with Session(get_engine()) as db:
+        assert db.get(HistoryCursorRecord, "23456:34567").last_message_id == "203"
+        assert db.get(HistoryScanCursorRecord, "23456:34567") is None
+    api = FakeAPI()
+    service = ChatService(settings, embedded)
+    result = await service.backfill_channel(34567, api=api)
+    assert result["imported"] == 202
+    assert [after for _, messages, after in api.calls if messages] == [0, 100, 200, 203]
+    with Session(get_engine()) as db:
+        assert len(db.exec(select(HistoryMessageRecord)).all()) == 203
+        assert db.get(HistoryScanCursorRecord, "23456:34567").last_message_id == "203"
+    again = FakeAPI()
+    await service.backfill_channel(34567, api=again)
+    assert [after for _, messages, after in again.calls if messages] == [203]
+
+
+async def test_backfill_resumes_saved_page_after_failure_and_new_live_message(settings, embedded):
+    from ai_kun.chat import ChatService
+    from ai_kun.db import HistoryScanCursorRecord
+
+    class InterruptedAPI(FakeAPI):
+        async def get(self, channel_id, *, messages=False, after=0):
+            if messages and after == 100:
+                raise UpstreamError("一時通信失敗")
+            return await super().get(channel_id, messages=messages, after=after)
+
+    service = ChatService(settings, embedded)
+    with pytest.raises(UpstreamError):
+        await service.backfill_channel(34567, api=InterruptedAPI())
+    await embedded.ingest_history_page(23456, 34567, [message(203)])
+    with Session(get_engine()) as db:
+        assert db.get(HistoryScanCursorRecord, "23456:34567").last_message_id == "100"
+    api = FakeAPI()
+    result = await service.backfill_channel(34567, api=api)
+    assert result["imported"] == 102
+    assert [after for _, messages, after in api.calls if messages] == [100, 200, 203]

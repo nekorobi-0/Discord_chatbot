@@ -63,6 +63,13 @@ class HistoryCursorRecord(SQLModel, table=True):
     last_message_id: str
 
 
+class HistoryScanCursorRecord(SQLModel, table=True):
+    """APIで欠落なく走査し、保存し終えた位置。ライブ観測位置とは分離する。"""
+
+    channel_key: str = Field(primary_key=True)
+    last_message_id: str
+
+
 class HistoryMessageRecord(SQLModel, table=True):
     # 削除した文書の対応も残し、再取り込みで復活させない。
     message_id: str = Field(primary_key=True)

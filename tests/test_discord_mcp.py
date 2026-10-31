@@ -9,7 +9,7 @@ from mcp.client.stdio import stdio_client
 
 from ai_kun.chat import ChatService
 from ai_kun.discord_mcp import DiscordMCP, DiscordReader, memory_session
-from ai_kun.history import DiscordHistoryAPI, HalfRateLimiter
+from ai_kun.history import DiscordHistoryAPI, DiscordRateLimiter
 from ai_kun.memory import ModelTurn, ToolCall
 from ai_kun.tools import ToolHub
 
@@ -149,7 +149,7 @@ async def test_history_api_pagination_uses_only_get():
         pass
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-        api = DiscordHistoryAPI("fake", http, HalfRateLimiter(sleep=no_wait))
+        api = DiscordHistoryAPI("fake", http, DiscordRateLimiter(sleep=no_wait))
         await api.get("34567", messages=True, limit=2, before="50001")
         await api.get("34567", messages=True, limit=2)
         await api.get("guilds/23456/channels", expect_list=True)
@@ -314,12 +314,12 @@ async def test_history_paging_wait_time_before_and_after(settings):
     async def measure(legacy):
         clock = Clock()
 
-        class LegacyLimiter(HalfRateLimiter):
+        class LegacyLimiter(DiscordRateLimiter):
             def observe(self, route, major, headers):
                 super().observe(route, major, headers)
                 self.global_next = max(self.global_next, self.clock() + 2)
 
-        limiter = (LegacyLimiter if legacy else HalfRateLimiter)(clock, clock.sleep)
+        limiter = (LegacyLimiter if legacy else DiscordRateLimiter)(clock, clock.sleep)
 
         def handler(request):
             return httpx.Response(200, json=[] if request.url.path.endswith("messages") else {"guild_id": "23456"})
@@ -334,7 +334,7 @@ async def test_history_paging_wait_time_before_and_after(settings):
         return clock.now
 
     # ヘッダーなしの同一チャンネル10ページ。通信・LLM時間を含まない制御時計での再現。
-    assert await measure(False) == pytest.approx(18.04)
+    assert await measure(False) == pytest.approx(0.2)
     assert await measure(True) == pytest.approx(38)
 
 
