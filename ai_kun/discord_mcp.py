@@ -21,6 +21,7 @@ from mcp.types import CallToolResult, ImageContent, TextContent, Tool, ToolAnnot
 from .config import DiscordSettings
 from .db import init_db
 from .discord_users import message_users, remember_users, resolve_users, search_users
+from .emoji_images import load_emoji_parts
 from .errors import AIKunError, InvalidInputError
 from .history import DiscordHistoryAPI, shared_limiter
 from .images import IMAGE_EXTENSIONS, image_data_url
@@ -229,7 +230,7 @@ class DiscordReader:
                     continue
                 selected.append((message["id"], attachment))
         if not selected:
-            return []
+            return await self.emoji_contents(messages, max_images=4)
         async with httpx.AsyncClient(timeout=8, follow_redirects=False, transport=self.image_transport) as client:
 
             async def fetch(message_id, attachment):
@@ -282,7 +283,24 @@ class DiscordReader:
                     return []
 
             results = await asyncio.gather(*(bounded_fetch(*item) for item in selected))
-        return [part for result in results for part in result]
+        return [part for result in results for part in result] + await self.emoji_contents(
+            messages, max_images=4 - len(selected)
+        )
+
+    async def emoji_contents(self, messages, *, max_images):
+        parts = await load_emoji_parts(
+            [(message.get("id"), message.get("content", "")) for message in messages],
+            max_images=max_images,
+            transport=self.image_transport,
+        )
+        result = []
+        for part in parts:
+            if part["type"] == "text":
+                result.append(TextContent(type="text", text=part["text"]))
+            else:
+                header, encoded = part["image_url"]["url"].split(",", 1)
+                result.append(ImageContent(type="image", mimeType=header[5:].split(";")[0], data=encoded))
+        return result
 
     async def read(self, name: str, arguments: dict) -> dict:
         if name not in {tool.name for tool in DISCORD_TOOLS}:

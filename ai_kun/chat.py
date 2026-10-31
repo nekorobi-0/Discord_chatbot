@@ -19,6 +19,7 @@ from .code_output import CodeFile, prepare_reply
 from .config import Settings
 from .discord_context import DiscordContext
 from .discord_users import public_user_names, remember_users, sdk_user
+from .emoji_images import load_emoji_parts
 from .errors import AIKunError, ConfigurationError, InvalidInputError, UpstreamError
 from .ingestion import stored_status
 from .memory import MemoryStore
@@ -293,8 +294,22 @@ class ChatService:
         phase("build_context")
         if items:
             metrics.increment("ai_kun.memory_retrievals_total")
+        phase("emoji_images")
+        emoji_sources = [(discord_context.message_id if discord_context else None, raw)]
+        if discord_context:
+            emoji_sources.extend(
+                (item.get("message_id"), item.get("content", "")) for item in reversed(discord_context.messages)
+            )
+        emoji_parts = await load_emoji_parts(
+            emoji_sources, max_images=max(0, 8 - len(images) - len(discord_context.images if discord_context else ()))
+        )
         messages = self._build_messages(
-            raw, (*documents, *items), images=images, channel_id=channel_id, discord_context=discord_context
+            raw,
+            (*documents, *items),
+            images=images,
+            channel_id=channel_id,
+            discord_context=discord_context,
+            emoji_parts=emoji_parts,
         )
 
         last_preview = 0.0
@@ -384,6 +399,7 @@ class ChatService:
         images: Sequence[str] = (),
         channel_id: int | None = None,
         discord_context: DiscordContext | None = None,
+        emoji_parts: Sequence[dict] = (),
     ) -> list[dict[str, object]]:
         prompt = SYSTEM_PROMPT
         prompt += f"\n設定済みDiscordサーバーID: {self._settings.discord.guild_id}"
@@ -417,7 +433,7 @@ class ChatService:
                 }
             )
         chain_images = discord_context.images if discord_context else ()
-        if images or chain_images:
+        if images or chain_images or emoji_parts:
             parts = [{"type": "text", "text": user_text}]
             parts.extend({"type": "image_url", "image_url": {"url": image, "detail": "low"}} for image in images)
             for image in chain_images:
@@ -436,6 +452,7 @@ class ChatService:
                     }
                 )
                 parts.append({"type": "image_url", "image_url": {"url": image.data_url, "detail": "low"}})
+            parts.extend(emoji_parts)
             messages.append({"role": "user", "content": parts})
         else:
             messages.append({"role": "user", "content": user_text})
