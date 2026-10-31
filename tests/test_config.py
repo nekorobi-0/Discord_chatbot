@@ -353,3 +353,13 @@ async def test_streaming_defaults_and_explicit_legacy_configuration(monkeypatch)
     assert LLMSettings.from_env().stream_enabled is False
     assert LLMSettings.from_env().first_token_timeout_seconds == 600
     assert OperationalSettings.from_env().request_timeout_seconds == 1800
+
+
+def test_prose_and_code_output_limits_are_independent(monkeypatch):
+    monkeypatch.setenv("MAX_OUTPUT_CHARS", "6000")
+    monkeypatch.setenv("MAX_CODE_TOKENS", "8192")
+    settings = OperationalSettings.from_env()
+    assert settings.max_output_chars == 6000 and settings.max_code_tokens == 8192
+    monkeypatch.setenv("MAX_CODE_TOKENS", "0")
+    with pytest.raises(ConfigurationError):
+        OperationalSettings.from_env()

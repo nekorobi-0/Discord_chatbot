@@ -49,7 +49,7 @@ class StreamAccumulator:
                 if not isinstance(content, str):
                     raise ValueError("invalid content")
                 self.text += content
-                if len(self.text) > 65536:
+                if len(self.text) > 4 * 1024 * 1024:
                     raise ValueError("content limit")
                 phase("llm_streaming")
                 await self.on_text(self.text)

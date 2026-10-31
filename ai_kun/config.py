@@ -168,7 +168,7 @@ class LLMSettings:
     api_key: str = field(repr=False, default="")
     model: str = ""
     temperature: float = 0.7
-    max_tokens: int = 1024
+    max_tokens: int = 10240
     timeout_seconds: float = 90.0
     first_token_timeout_seconds: float = 300.0
     stream_timeout_seconds: float = 900.0
@@ -181,7 +181,7 @@ class LLMSettings:
             api_key=_secret("LLM_API_KEY"),
             model=_model_id("LLM_MODEL"),
             temperature=_float("LLM_TEMPERATURE", 0.7, 0.0, 2.0),
-            max_tokens=_int("LLM_MAX_TOKENS", 1024, 64, 8192),
+            max_tokens=_int("LLM_MAX_TOKENS", 10240, 64, 65536),
             timeout_seconds=_float("LLM_TIMEOUT_SECONDS", 90.0, 5.0, 300.0),
             first_token_timeout_seconds=_float("LLM_FIRST_TOKEN_TIMEOUT_SECONDS", 300.0, 5.0, 1800.0),
             stream_timeout_seconds=_float("LLM_STREAM_TIMEOUT_SECONDS", 900.0, 30.0, 3600.0),
@@ -287,16 +287,18 @@ class OperationalSettings:
     http_host: str = "0.0.0.0"
     http_port: int = 8080
     request_timeout_seconds: float = 1200.0
+    max_code_tokens: int = 8192
 
     @classmethod
     def from_env(cls) -> OperationalSettings:
         return cls(
             audit_log_enabled=_bool("AUDIT_LOG_ENABLED", True),
-            max_output_chars=_int("MAX_OUTPUT_CHARS", 1_800, 200, 1_900),
+            max_output_chars=_int("MAX_OUTPUT_CHARS", 1_800, 200, 32_000),
             http_enabled=_bool("HTTP_ENABLED", True),
             http_host=_raw("HTTP_HOST") or "0.0.0.0",
             http_port=_int("HTTP_PORT", 8080, 1, 65535),
             request_timeout_seconds=_float("REQUEST_TIMEOUT_SECONDS", 1200.0, 30.0, 7200.0),
+            max_code_tokens=_int("MAX_CODE_TOKENS", 8192, 256, 32768),
         )
 
 

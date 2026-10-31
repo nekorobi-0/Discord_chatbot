@@ -11,6 +11,7 @@ import discord
 from discord import app_commands
 
 from ..chat import ChatService, RetrievedItem
+from ..code_output import PreparedReply
 from ..config import Settings
 from ..discord_context import DiscordContext
 from ..discord_users import public_user_names, remember_users, sdk_user
@@ -153,7 +154,8 @@ class AIKunClient(discord.Client):
             try:
                 result = await self._execute(operation)
                 if publisher:
-                    result = public_user_names(result, self.settings.discord.guild_id)
+                    visible = public_user_names(str(result), self.settings.discord.guild_id)
+                    result = result.with_text(visible) if isinstance(result, PreparedReply) else visible
                     await publisher.finish(result, failed=trace.failed)
                 return result
             except asyncio.CancelledError:
@@ -260,15 +262,23 @@ class AIKunClient(discord.Client):
         await interaction.response.defer(thinking=True, ephemeral=ephemeral)
         request_id = f"interaction-{getattr(interaction, 'id', 'unknown')}"
 
-        async def send(text):
+        async def send(text, *, files=None):
             return await interaction.followup.send(
                 text,
                 ephemeral=ephemeral,
                 allowed_mentions=discord.AllowedMentions.none(),
                 wait=True,
+                **({"files": files} if files else {}),
             )
 
-        publisher = StreamReply(send, split_message, request_id=request_id, kind="followup")
+        publisher = StreamReply(
+            send,
+            split_message,
+            request_id=request_id,
+            kind="followup",
+            code_token_limit=self.settings.operational.max_code_tokens,
+            prose_limit=self.settings.operational.max_output_chars,
+        )
         await self._run(operation, request_id=request_id, publisher=publisher)
 
     def _register_commands(self) -> None:
@@ -278,13 +288,12 @@ class AIKunClient(discord.Client):
             async def operation():
                 user = getattr(interaction, "user", None)
                 context = DiscordContext(author_id=str(user.id)) if user is not None else None
-                return (
-                    await self.service.generate_reply(
-                        question,
-                        channel_id=interaction.channel_id,
-                        discord_context=context,
-                    )
-                ).content
+                answer = await self.service.generate_reply(
+                    question,
+                    channel_id=interaction.channel_id,
+                    discord_context=context,
+                )
+                return PreparedReply(answer.content, files=getattr(answer, "files", ()))
 
             await self._answer(interaction, operation)
 
@@ -443,10 +452,21 @@ class AIKunClient(discord.Client):
 
         request_id = str(getattr(message, "id", uuid.uuid4().hex[:12]))
 
-        async def send(text):
-            return await message.reply(text, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+        async def send(text, *, files=None):
+            return await message.reply(
+                text,
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+                **({"files": files} if files else {}),
+            )
 
-        publisher = StreamReply(send, split_message, request_id=request_id)
+        publisher = StreamReply(
+            send,
+            split_message,
+            request_id=request_id,
+            code_token_limit=self.settings.operational.max_code_tokens,
+            prose_limit=self.settings.operational.max_output_chars,
+        )
         await self._run(operation, request_id=request_id, publisher=publisher)
 
     async def _process_attachments(
@@ -524,5 +544,5 @@ class AIKunClient(discord.Client):
                 answer = await self.service.generate_reply(text, documents=documents, **reply_kwargs)
             else:
                 answer = await self.service.generate_reply(text, **reply_kwargs)
-            return "\n\n".join([answer.content, *notices])
+            return PreparedReply("\n\n".join([answer.content, *notices]), files=getattr(answer, "files", ()))
         raise InvalidInputError("質問か、テキスト資料・画像・音声ファイルを送ってください。")
