@@ -430,7 +430,7 @@ async def test_oversized_file_is_rejected_before_download_or_asr(settings, store
         await client.close()
 
 
-@pytest.mark.parametrize("content", ["", "!ai この画像を説明して", "画像を説明して"])
+@pytest.mark.parametrize("content", ["!ai", "!ai この画像を説明して", "<@222> 見て", "<@!222> 見て"])
 async def test_image_attachment_reaches_multimodal_llm_without_asr(settings, store, monkeypatch, content):
     import base64
 
@@ -444,6 +444,7 @@ async def test_image_attachment_reaches_multimodal_llm_without_asr(settings, sto
     transcribe = AsyncMock()
     monkeypatch.setattr(service, "transcribe_attachment", transcribe)
     client = AIKunClient(settings, service)
+    client._connection.user = SimpleNamespace(id=222)
     attachment = SimpleNamespace(filename="sample.PNG", size=len(image), read=AsyncMock(return_value=image))
     message = file_message(content, [attachment])
     try:
@@ -457,6 +458,29 @@ async def test_image_attachment_reaches_multimodal_llm_without_asr(settings, sto
         assert url.startswith("data:image/png;base64,")
         assert base64.b64decode(url.split(",", 1)[1]) == image
         assert message.reply.await_args.args[0] == "画像を確認しました"
+        message.channel.send.assert_not_awaited()
+    finally:
+        await client.drain()
+        await client.close()
+
+
+@pytest.mark.parametrize("content", ["", "画像を説明して"])
+@pytest.mark.parametrize("extension", ["PNG", "jpg", "webp", "gif"])
+async def test_image_attachment_without_hook_does_not_trigger_reply(settings, store, monkeypatch, content, extension):
+    service = ChatService(settings, store)
+    ingest = AsyncMock()
+    generate = AsyncMock()
+    monkeypatch.setattr(service, "ingest_message", ingest)
+    monkeypatch.setattr(service, "generate_reply", generate)
+    client = AIKunClient(settings, service)
+    attachment = file_attachment(f"sample.{extension}", "image bytes")
+    message = file_message(content, [attachment])
+    try:
+        await client.on_message(message)
+        ingest.assert_awaited_once_with(message)
+        attachment.read.assert_not_awaited()
+        generate.assert_not_awaited()
+        message.reply.assert_not_awaited()
         message.channel.send.assert_not_awaited()
     finally:
         await client.drain()

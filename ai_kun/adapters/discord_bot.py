@@ -377,8 +377,7 @@ class AIKunClient(discord.Client):
         elif is_bot_reply:
             pass
         elif not any(
-            attachment.filename.lower().endswith(tuple(DOCUMENT_EXTENSIONS | IMAGE_EXTENSIONS))
-            for attachment in message.attachments
+            attachment.filename.lower().endswith(tuple(DOCUMENT_EXTENSIONS)) for attachment in message.attachments
         ):
             return
 
