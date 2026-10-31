@@ -2,7 +2,10 @@
 
 import asyncio
 import logging
+import time
+import uuid
 from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
 
 import discord
 from discord import app_commands
@@ -14,12 +17,17 @@ from ..errors import AIKunError, InvalidInputError
 from ..images import IMAGE_EXTENSIONS, image_data_url
 from ..memory import DOCUMENT_EXTENSIONS, VOICE_EXTENSIONS
 from ..observability import metrics
+from ..request_diagnostics import RequestTrace, current_trace, phase
 from ..text_files import FILE_TOKEN_LIMIT
 from ..work_queue import WorkQueue
 from .reply_chain import collect_reply_chain, resolve_reply
 
 logger = logging.getLogger(__name__)
 MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
+RESPONSE_TIMEOUT_SECONDS = 240
+REQUEST_HEARTBEAT_SECONDS = 15
+DISCORD_IO_TIMEOUT_SECONDS = 30
+TYPING_TIMEOUT_SECONDS = 3
 
 
 def allowed(settings: Settings, guild_id: int | None) -> bool:
@@ -112,20 +120,98 @@ class AIKunClient(discord.Client):
             if permissions.view_channel and permissions.read_message_history:
                 self._schedule_backfill(channel.id)
 
-    async def _run(self, operation: Callable[[], Awaitable[str]]) -> str:
-        return await self._response_queue.submit(lambda: self._execute(operation))
+    async def _run(self, operation: Callable[[], Awaitable[str]], *, request_id: str | None = None) -> str:
+        trace = RequestTrace(request_id or uuid.uuid4().hex[:12])
+        logger.info("request queued: request=%s", trace.request_id)
+
+        async def execute():
+            token = current_trace.set(trace)
+            phase("starting")
+            logger.info(
+                "request started: request=%s queue_seconds=%.3f",
+                trace.request_id,
+                time.monotonic() - trace.accepted_at,
+            )
+            heartbeat = asyncio.create_task(self._request_heartbeat(trace))
+            started = time.monotonic()
+            try:
+                return await self._execute(operation)
+            except asyncio.CancelledError:
+                logger.warning("request cancelled: request=%s phase=%s", trace.request_id, trace.phase)
+                raise
+            finally:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
+                logger.info(
+                    "request finished: request=%s phase=%s seconds=%.3f",
+                    trace.request_id,
+                    trace.phase,
+                    time.monotonic() - started,
+                )
+                current_trace.reset(token)
+
+        return await self._response_queue.submit(execute)
+
+    async def _request_heartbeat(self, trace):
+        while True:
+            await asyncio.sleep(REQUEST_HEARTBEAT_SECONDS)
+            logger.info(
+                "request pending: request=%s phase=%s total_seconds=%.3f",
+                trace.request_id,
+                trace.phase,
+                time.monotonic() - trace.accepted_at,
+            )
+
+    @asynccontextmanager
+    async def _typing(self, channel):
+        manager = channel.typing()
+        entered = False
+        try:
+            await asyncio.wait_for(manager.__aenter__(), timeout=TYPING_TIMEOUT_SECONDS)
+            entered = True
+        except Exception as exc:
+            logger.warning("typing unavailable: error=%s", type(exc).__name__)
+        try:
+            yield
+        finally:
+            if entered:
+                try:
+                    await asyncio.wait_for(manager.__aexit__(None, None, None), timeout=TYPING_TIMEOUT_SECONDS)
+                except Exception as exc:
+                    logger.warning("typing cleanup failed: error=%s", type(exc).__name__)
 
     async def _execute(self, operation: Callable[[], Awaitable[str]]) -> str:
         # キュー待機時間は実行タイムアウトへ含めない。
         try:
-            return await asyncio.wait_for(operation(), timeout=240)
+            return await asyncio.wait_for(operation(), timeout=RESPONSE_TIMEOUT_SECONDS)
         except AIKunError as exc:
+            trace = current_trace.get()
+            logger.warning(
+                "request failed: request=%s phase=%s error=%s service=%s",
+                trace.request_id if trace else "unknown",
+                trace.phase if trace else "unknown",
+                type(exc).__name__,
+                getattr(exc, "service", "internal"),
+            )
             return exc.user_message()
         except TimeoutError:
+            trace = current_trace.get()
+            logger.warning(
+                "request timed out: request=%s phase=%s timeout=%s",
+                trace.request_id if trace else "unknown",
+                trace.phase if trace else "unknown",
+                RESPONSE_TIMEOUT_SECONDS,
+            )
             return "時間がかかりすぎたため中断しました。少し待ってから試してください。"
         except Exception as exc:
             # 例外本文は外部レスポンスや秘密を含む場合があるため出さない。
-            logger.warning("request failed: %s", type(exc).__name__)
+            trace = current_trace.get()
+            logger.warning(
+                "request failed: request=%s phase=%s error=%s",
+                trace.request_id if trace else "unknown",
+                trace.phase if trace else "unknown",
+                type(exc).__name__,
+            )
             metrics.increment("ai_kun.failures_total")
             return "処理に失敗しました。管理者に設定の確認をお願いしてください。"
 
@@ -143,9 +229,24 @@ class AIKunClient(discord.Client):
 
     async def _answer(self, interaction: discord.Interaction, operation, *, ephemeral=False) -> None:
         await interaction.response.defer(thinking=True, ephemeral=ephemeral)
-        result = await self._run(operation)
-        for chunk in split_message(result):
-            await interaction.followup.send(chunk, ephemeral=ephemeral, allowed_mentions=discord.AllowedMentions.none())
+        request_id = f"interaction-{getattr(interaction, 'id', 'unknown')}"
+        result = await self._run(operation, request_id=request_id)
+        try:
+            logger.info("Discord followup started: request=%s", request_id)
+            async with asyncio.timeout(DISCORD_IO_TIMEOUT_SECONDS):
+                for chunk in split_message(result):
+                    await interaction.followup.send(
+                        chunk, ephemeral=ephemeral, allowed_mentions=discord.AllowedMentions.none()
+                    )
+            logger.info("Discord followup completed: request=%s", request_id)
+        except (TimeoutError, discord.HTTPException) as exc:
+            logger.warning(
+                "Discord followup failed: request=%s error=%s status=%s code=%s",
+                request_id,
+                type(exc).__name__,
+                getattr(exc, "status", None),
+                getattr(exc, "code", None),
+            )
 
     def _register_commands(self) -> None:
         @self.tree.command(name="ask", description="AIくんに質問する（会話は自動保存しません）")
@@ -282,15 +383,31 @@ class AIKunClient(discord.Client):
             return
 
         async def operation():
-            context = await collect_reply_chain(message, reply_target, reply_stop)
-            return await self._process_attachments(
-                content, message.attachments, message.channel.id, discord_context=context
-            )
+            # キュー待機中はtypingを維持しない。typing APIの停止も推論を妨げない。
+            async with self._typing(message.channel):
+                phase("reply_chain")
+                context = await collect_reply_chain(message, reply_target, reply_stop)
+                phase("attachments")
+                return await self._process_attachments(
+                    content, message.attachments, message.channel.id, discord_context=context
+                )
 
-        async with message.channel.typing():
-            result = await self._run(operation)
-        for chunk in split_message(result):
-            await message.reply(chunk, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+        request_id = str(getattr(message, "id", uuid.uuid4().hex[:12]))
+        result = await self._run(operation, request_id=request_id)
+        try:
+            logger.info("Discord reply started: request=%s", request_id)
+            async with asyncio.timeout(DISCORD_IO_TIMEOUT_SECONDS):
+                for chunk in split_message(result):
+                    await message.reply(chunk, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+            logger.info("Discord reply completed: request=%s", request_id)
+        except (TimeoutError, discord.HTTPException) as exc:
+            logger.warning(
+                "Discord reply failed: request=%s error=%s status=%s code=%s",
+                request_id,
+                type(exc).__name__,
+                getattr(exc, "status", None),
+                getattr(exc, "code", None),
+            )
 
     async def _process_attachments(
         self, content: str, attachments, channel_id: int, *, discord_context: DiscordContext | None = None

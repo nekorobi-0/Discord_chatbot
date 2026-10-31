@@ -21,6 +21,7 @@ from .errors import AIKunError, ConfigurationError, InvalidInputError, UpstreamE
 from .ingestion import stored_status
 from .memory import MemoryStore
 from .observability import AuditLog, metrics
+from .request_diagnostics import phase
 from .text_files import FILE_TOKEN_LIMIT, FileText, limit_file_text
 from .tools import ToolHub
 from .work_queue import MessageQueue, WorkQueue
@@ -226,6 +227,7 @@ class ChatService:
         channel_id: int | None = None,
         discord_context: DiscordContext | None = None,
     ) -> ChatResult:
+        phase("reply_lock")
         async with self._reply_lock:
             return await self._generate_reply(
                 content, documents=documents, images=images, channel_id=channel_id, discord_context=discord_context
@@ -250,7 +252,9 @@ class ChatService:
 
         # 質問はすべて記憶検索を対象にする（オプトアウト廃止）。
         attached = {document.label.split(" ", 1)[0] for document in documents}
+        phase("rag_search")
         items = tuple(item for item in await self._retrieve(raw) if item.label.split(" ", 1)[0] not in attached)
+        phase("build_context")
         if items:
             metrics.increment("ai_kun.memory_retrievals_total")
         messages = self._build_messages(
@@ -351,6 +355,7 @@ class ChatService:
         image_bytes = 0
         for round_no in range(MAX_TOOL_ROUNDS):
             try:
+                phase(f"llm_round_{round_no + 1}")
                 started = time.monotonic()
                 turn = await self._memory.complete_chat(
                     messages,
@@ -388,6 +393,7 @@ class ChatService:
             image_parts = []
             for call in turn.tool_calls[:8]:
                 args = _safe_json(call.arguments)
+                phase(f"tool:{call.name}")
                 result = await self._tools.execute(call.name, args)
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": str(result)})
                 parts = getattr(result, "image_parts", ())

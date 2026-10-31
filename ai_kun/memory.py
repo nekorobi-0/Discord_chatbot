@@ -40,6 +40,7 @@ from .db import (
 )
 from .errors import InvalidInputError, RateLimitError, UpstreamError
 from .ingestion import IngestionMonitor
+from .request_diagnostics import phase, request_id
 from .work_queue import WorkQueue
 
 logger = logging.getLogger("ai_kun.memory")
@@ -134,12 +135,43 @@ class MemoryStore:
         literal = (urlparse(base).hostname or "").lower()
         if target.scheme == "http" and _looks_like_literal(literal) and not self._is_internal_ip(literal):
             raise UpstreamError("外部サービス")
+        service = "LLM" if url.endswith("/chat/completions") else "Embedding"
+        phase(f"{service.lower()}_http")
+        started = time.monotonic()
+        timeout = float(self._llm.timeout_seconds)
+        logger.info("upstream started: request=%s service=%s timeout=%.1f", request_id(), service, timeout)
         try:
-            async with httpx.AsyncClient(timeout=float(self._llm.timeout_seconds), follow_redirects=False) as client:
-                return await client.request(method, url, **kwargs)
+            # httpxのread timeoutは無通信時間。少量ずつ返り続ける応答にも総時間の上限を設ける。
+            async with asyncio.timeout(timeout):
+                async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+                    response = await client.request(method, url, **kwargs)
+            logger.info(
+                "upstream completed: request=%s service=%s status=%d seconds=%.3f",
+                request_id(),
+                service,
+                response.status_code,
+                time.monotonic() - started,
+            )
+            phase(f"{service.lower()}_response")
+            return response
+        except (TimeoutError, httpx.TimeoutException) as exc:
+            logger.warning(
+                "upstream timeout: request=%s service=%s error=%s seconds=%.3f",
+                request_id(),
+                service,
+                type(exc).__name__,
+                time.monotonic() - started,
+            )
+            raise UpstreamError(f"{service}（応答タイムアウト）") from exc
         except httpx.HTTPError as exc:
-            logger.warning("upstream transport error: %s", type(exc).__name__)
-            raise UpstreamError("外部サービス") from exc
+            logger.warning(
+                "upstream transport error: request=%s service=%s error=%s seconds=%.3f",
+                request_id(),
+                service,
+                type(exc).__name__,
+                time.monotonic() - started,
+            )
+            raise UpstreamError(f"{service}（接続エラー）") from exc
 
     async def complete_chat(
         self,
