@@ -26,6 +26,50 @@ def sdk_user(user) -> dict:
     return data
 
 
+def author_context(user, *, member=None, cached=None) -> dict:
+    """SDKとRESTの投稿者を同じ形式へ変換する。名前は未信頼データとして扱う。"""
+    if isinstance(user, dict):
+        data = dict(user)
+    elif user is not None:
+        data = sdk_user(user) if getattr(user, "id", None) is not None else {}
+        data["bot"] = bool(getattr(user, "bot", False))
+        data["display_name"] = getattr(user, "display_name", None)
+    else:
+        data = {}
+    if isinstance(member, dict) and "nick" in member:
+        data["nick"] = member["nick"]
+    cached = cached or {}
+
+    def name(field):
+        value = data[field] if field in data else cached.get(field)
+        return " ".join(str(value or "").split())[:100] or None
+
+    username, global_name, nick = name("username"), name("global_name"), name("nick")
+    display_name = nick or global_name or username or name("display_name") or name("name")
+    return {
+        "id": str(data.get("id") or ""),
+        "name": display_name,
+        "display_name": display_name,
+        "username": username,
+        "global_name": global_name,
+        "nick": nick,
+        "bot": bool(data.get("bot", False)),
+    }
+
+
+def prepare_author_contexts(guild_id, users) -> list[dict]:
+    """RESTの部分的な投稿者情報を観測済みの同一サーバーの名前で一括補完する。"""
+    users = list(users)
+    remember_users(guild_id, users)
+    ids = list(dict.fromkeys(str(user.get("id", "")) for user in users))
+    found = {}
+    for offset in range(0, len(ids), 256):
+        found.update(
+            {row["user_id"]: row for row in cached_users(guild_id, ids[offset : offset + 256], include_profile=True)}
+        )
+    return [author_context(user, cached=found.get(str(user.get("id", "")))) for user in users]
+
+
 def message_users(messages) -> list[dict]:
     result = []
     for message in messages:
@@ -69,7 +113,7 @@ def remember_users(guild_id, users):
         session.commit()
 
 
-def cached_users(guild_id, user_ids=None) -> list[dict]:
+def cached_users(guild_id, user_ids=None, *, include_profile=False) -> list[dict]:
     query = select(DiscordUserRecord).where(DiscordUserRecord.guild_id == str(guild_id))
     if user_ids is not None:
         if not user_ids:
@@ -81,6 +125,11 @@ def cached_users(guild_id, user_ids=None) -> list[dict]:
                 "user_id": row.user_id,
                 "display_name": row.nickname or row.global_name or row.username or None,
                 "aliases": list(dict.fromkeys(name for name in (row.nickname, row.global_name, row.username) if name)),
+                **(
+                    {"username": row.username or None, "global_name": row.global_name or None, "nick": row.nickname}
+                    if include_profile
+                    else {}
+                ),
             }
             for row in session.exec(query)
         ]

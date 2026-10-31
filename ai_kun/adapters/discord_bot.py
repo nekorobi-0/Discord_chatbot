@@ -14,7 +14,7 @@ from ..chat import ChatService, RetrievedItem
 from ..code_output import PreparedReply
 from ..config import Settings
 from ..discord_context import DiscordContext
-from ..discord_users import public_user_names, remember_users, sdk_user
+from ..discord_users import author_context, public_user_names, remember_users, sdk_user
 from ..errors import AIKunError, InvalidInputError
 from ..file_types import attachment_kind, is_document_trigger
 from ..images import image_data_url
@@ -287,7 +287,11 @@ class AIKunClient(discord.Client):
         async def ask(interaction: discord.Interaction, question: str):
             async def operation():
                 user = getattr(interaction, "user", None)
-                context = DiscordContext(author_id=str(user.id)) if user is not None else None
+                if user is not None:
+                    await asyncio.to_thread(remember_users, self.settings.discord.guild_id, [sdk_user(user)])
+                context = (
+                    DiscordContext(author_id=str(user.id), author=author_context(user)) if user is not None else None
+                )
                 answer = await self.service.generate_reply(
                     question,
                     channel_id=interaction.channel_id,

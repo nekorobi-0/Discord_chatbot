@@ -20,7 +20,7 @@ from mcp.types import CallToolResult, ImageContent, TextContent, Tool, ToolAnnot
 
 from .config import DiscordSettings
 from .db import init_db
-from .discord_users import message_users, remember_users, resolve_users, search_users
+from .discord_users import author_context, message_users, prepare_author_contexts, resolve_users, search_users
 from .emoji_images import load_emoji_parts
 from .errors import AIKunError, InvalidInputError
 from .history import DiscordHistoryAPI, shared_limiter
@@ -191,18 +191,14 @@ class DiscordReader:
         self._channels[channel_id] = (self.clock() + 60, channel)
         return channel
 
-    def message(self, data, channel_id):
-        author = data.get("author") or {}
+    def message(self, data, channel_id, *, author=None):
+        author = author if author is not None else author_context(data.get("author"), member=data.get("member"))
         message_id = str(data.get("id", ""))
         reference = data.get("message_reference") or {}
         return {
             "id": message_id,
             "channel_id": channel_id,
-            "author": {
-                "id": str(author.get("id", "")),
-                "name": str(author.get("global_name") or author.get("username") or "")[:100],
-                "bot": bool(author.get("bot")),
-            },
+            "author": author,
             "content": str(data.get("content") or "")[:4000],
             "timestamp": data.get("timestamp"),
             "reply_to_message_id": reference.get("message_id"),
@@ -394,8 +390,10 @@ class DiscordReader:
             if name == "discord_get_message":
                 message_id = snowflake(arguments.get("message_id"))
                 data = await api.get(f"channels/{channel_id}/messages/{message_id}")
-                remember_users(self.settings.guild_id, message_users([data]))
-                return {"message": self.message(data, channel_id)}
+                authors = await asyncio.to_thread(
+                    prepare_author_contexts, self.settings.guild_id, message_users([data])
+                )
+                return {"message": self.message(data, channel_id, author=authors[0])}
             limit = arguments.get("limit", 20)
             if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
                 raise InvalidInputError("取得件数は1〜100件で指定してください。")
@@ -408,10 +406,12 @@ class DiscordReader:
             if after is not None:
                 after = snowflake(after)
             data = await api.get(channel_id, messages=True, limit=limit, before=before, after=after)
-            remember_users(self.settings.guild_id, message_users(data[:limit]))
+            authors = await asyncio.to_thread(
+                prepare_author_contexts, self.settings.guild_id, message_users(data[:limit])
+            )
             messages = []
-            for item in data[:limit]:
-                candidate = self.message(item, channel_id)
+            for item, author in zip(data[:limit], authors, strict=True):
+                candidate = self.message(item, channel_id, author=author)
                 if len(json.dumps(messages + [candidate], ensure_ascii=False)) > _MAX_RESULT_CHARS:
                     break
                 messages.append(candidate)

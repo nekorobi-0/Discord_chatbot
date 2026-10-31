@@ -21,3 +21,4 @@ class DiscordContext:
     author_id: str | None = None
     images: tuple[DiscordImage, ...] = ()
     stickers: tuple[Mapping[str, object], ...] = ()
+    author: Mapping[str, object] | None = None

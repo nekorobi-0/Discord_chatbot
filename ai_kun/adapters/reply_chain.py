@@ -5,6 +5,7 @@ import logging
 import discord
 
 from ..discord_context import DiscordContext
+from ..discord_users import author_context
 from ..sticker_images import sticker_record
 from .reply_images import load_reply_images
 
@@ -55,6 +56,7 @@ async def resolve_reply(message, channel, guild_id: int, *, refresh=False):
 
 def message_record(message, *, channel_id: int, guild_id: int) -> dict:
     author = getattr(message, "author", None)
+    profile = author_context(author)
     timestamp = getattr(message, "created_at", None)
     return {
         "message_id": str(message.id),
@@ -62,7 +64,8 @@ def message_record(message, *, channel_id: int, guild_id: int) -> dict:
         "channel_id": str(channel_id),
         "reply_to_message_id": reply_id(message),
         "author_id": str(author.id) if author is not None else None,
-        "author_name": str(getattr(author, "display_name", None) or getattr(author, "name", None) or ""),
+        "author_name": profile["display_name"] or "",
+        "author": profile,
         "author_is_bot": bool(getattr(author, "bot", False)),
         "timestamp": timestamp.isoformat() if timestamp is not None else None,
         "content": str(getattr(message, "content", "") or ""),
@@ -110,4 +113,5 @@ async def collect_reply_chain(message, first_target, first_stop_reason=None) -> 
         author_id=str(message.author.id) if getattr(getattr(message, "author", None), "id", None) is not None else None,
         images=images,
         stickers=tuple(sticker_record(sticker) for sticker in getattr(message, "stickers", ())),
+        author=author_context(getattr(message, "author", None)),
     )
