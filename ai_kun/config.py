@@ -176,6 +176,20 @@ class LLMSettings:
 
     @classmethod
     def from_env(cls) -> LLMSettings:
+        # Mistral は OpenAI 互換 API。専用キーがあれば既存のローカルLLM設定より優先する。
+        mistral_api_key = _secret("MISTRAL_API_KEY")
+        if mistral_api_key:
+            return cls(
+                base_url=_https_base_url("MISTRAL_BASE_URL", default="https://api.mistral.ai/v1"),
+                api_key=mistral_api_key,
+                model=_model_id("MISTRAL_MODEL", default="mistral-small-latest"),
+                temperature=_float("LLM_TEMPERATURE", 0.7, 0.0, 2.0),
+                max_tokens=_int("LLM_MAX_TOKENS", 10240, 64, 65536),
+                timeout_seconds=_float("LLM_TIMEOUT_SECONDS", 90.0, 5.0, 300.0),
+                first_token_timeout_seconds=_float("LLM_FIRST_TOKEN_TIMEOUT_SECONDS", 300.0, 5.0, 1800.0),
+                stream_timeout_seconds=_float("LLM_STREAM_TIMEOUT_SECONDS", 900.0, 30.0, 3600.0),
+                stream_enabled=_bool("LLM_STREAM_ENABLED", True),
+            )
         return cls(
             base_url=_https_base_url("LLM_BASE_URL"),
             api_key=_secret("LLM_API_KEY"),
