@@ -173,6 +173,7 @@ class LLMSettings:
     first_token_timeout_seconds: float = 300.0
     stream_timeout_seconds: float = 900.0
     stream_enabled: bool = True
+    parallel_requests: bool = False
 
     @classmethod
     def from_env(cls) -> LLMSettings:
@@ -189,6 +190,7 @@ class LLMSettings:
                 first_token_timeout_seconds=_float("LLM_FIRST_TOKEN_TIMEOUT_SECONDS", 300.0, 5.0, 1800.0),
                 stream_timeout_seconds=_float("LLM_STREAM_TIMEOUT_SECONDS", 900.0, 30.0, 3600.0),
                 stream_enabled=_bool("LLM_STREAM_ENABLED", True),
+                parallel_requests=True,
             )
         return cls(
             base_url=_https_base_url("LLM_BASE_URL"),

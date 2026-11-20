@@ -34,7 +34,7 @@ chmod 600 .env
 | `GUILD_ID` | 利用するサーバーID |
 | `LLM_BASE_URL` | Chat Completions互換APIのベースURL。例: `http://127.0.0.1:11434/v1` |
 | `LLM_API_KEY` / `LLM_MODEL` | 認証が必要な場合のキー・導入したモデルID |
-| `MISTRAL_API_KEY` | 任意。設定するとMistral APIへ自動切替（`MISTRAL_MODEL` は既定 `mistral-small-latest`） |
+| `MISTRAL_API_KEY` | 任意。設定するとMistral APIへ自動切替し、リクエストを並列処理（`MISTRAL_MODEL` は既定 `mistral-small-latest`） |
 | `EMBEDDING_MODEL` / `EMBEDDING_DIMENSION` | 埋め込みモデルIDと出力次元。既定は `embeddinggemma-2`（768次元） |
 
 `EMBEDDING_BASE_URL` と `EMBEDDING_API_KEY` が空なら、LLMと同じ設定を使います。埋め込みサービスは `/embeddings` と `dimensions` パラメータに対応し、指定次元の数値配列を返す必要があります。Embeddingの既定モデルは `embeddinggemma-2` です。Chat Completions互換でないAPIはそのまま接続できません。

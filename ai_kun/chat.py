@@ -260,6 +260,15 @@ class ChatService:
         discord_context: DiscordContext | None = None,
         on_update: TextUpdate | None = None,
     ) -> ChatResult:
+        if self._settings.llm.parallel_requests:
+            return await self._generate_reply(
+                content,
+                documents=documents,
+                images=images,
+                channel_id=channel_id,
+                discord_context=discord_context,
+                on_update=on_update or current_text_update.get(),
+            )
         phase("reply_lock")
         async with self._reply_lock:
             return await self._generate_reply(

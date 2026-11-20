@@ -85,6 +85,7 @@ class AIKunClient(discord.Client):
         self.settings = settings
         self.service = service
         self._response_queue = WorkQueue()
+        self._parallel_responses: set[asyncio.Task] = set()
         self._message_tasks: set[asyncio.Task] = set()
         self._history_tasks: set[asyncio.Task] = set()
         self._history_task_channels: dict[asyncio.Task, int] = {}
@@ -181,7 +182,16 @@ class AIKunClient(discord.Client):
                 current_text_update.reset(update_token)
                 current_trace.reset(token)
 
-        return await self._response_queue.submit(execute)
+        if not self.settings.llm.parallel_requests:
+            return await self._response_queue.submit(execute)
+        task = asyncio.current_task()
+        if task is not None:
+            self._parallel_responses.add(task)
+        try:
+            return await execute()
+        finally:
+            if task is not None:
+                self._parallel_responses.discard(task)
 
     async def _request_heartbeat(self, trace):
         while True:
@@ -261,6 +271,8 @@ class AIKunClient(discord.Client):
             await asyncio.gather(*self._message_tasks, return_exceptions=True)
         if self._history_tasks:
             await asyncio.gather(*self._history_tasks, return_exceptions=True)
+        if self._parallel_responses:
+            await asyncio.gather(*tuple(self._parallel_responses), return_exceptions=True)
         await self._response_queue.join()
         await self.service.drain()
 
