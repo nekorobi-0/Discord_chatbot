@@ -130,7 +130,7 @@ class DiscordHistoryAPI:
         self.token = token
         self.limiter = limiter or DiscordRateLimiter()
 
-    async def get(self, resource, *, messages=False, after=None, before=None, limit=100, expect_list=False):
+    async def get(self, resource, *, messages=False, after=None, before=None, limit=100, expect_list=False, params=None):
         """チャンネルIDまたはDiscord APIパス（例: guilds/<id>/channels）へのGET。"""
         route = "messages" if messages else "resource"
         channel_id = resource
@@ -139,7 +139,6 @@ class DiscordHistoryAPI:
             if messages
             else (f"/channels/{channel_id}" if str(resource).isdigit() else f"/{resource}")
         )
-        params = None
         if messages:
             params = {"limit": limit}
             if after is not None:
@@ -202,6 +201,34 @@ class DiscordHistoryAPI:
             ):
                 raise UpstreamError("Discord履歴取得")
             return data
+
+
+async def sync_guild_members(guild_id: int, token: str, *, api=None) -> int:
+    """ギルドメンバー全員をDiscord APIからページ取得して表示名キャッシュへ保存する。"""
+    from .discord_users import remember_users
+
+    async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
+        api = api or DiscordHistoryAPI(token, client, shared_limiter)
+        after = "0"
+        total = 0
+        while True:
+            members = await api.get(
+                f"guilds/{guild_id}/members",
+                expect_list=True,
+                params={"limit": 1000, "after": after},
+            )
+            users = []
+            for member in members:
+                user = member.get("user")
+                if isinstance(user, dict) and user.get("id"):
+                    users.append({**user, "nick": member.get("nick")})
+            await asyncio.to_thread(remember_users, guild_id, users)
+            total += len(users)
+            if len(members) < 1000:
+                return total
+            after = str(members[-1].get("user", {}).get("id", ""))
+            if not after.isdigit():
+                raise UpstreamError("Discordメンバー一覧")
         raise UpstreamError("Discord履歴取得（再試行上限）")
 
 

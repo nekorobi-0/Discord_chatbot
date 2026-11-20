@@ -17,6 +17,7 @@ from ..discord_context import DiscordContext
 from ..discord_users import author_context, public_user_names, remember_users, sdk_user
 from ..errors import AIKunError, InvalidInputError
 from ..file_types import attachment_kind, is_document_trigger
+from ..history import sync_guild_members
 from ..images import image_data_url
 from ..observability import metrics
 from ..request_diagnostics import RequestTrace, current_trace, phase
@@ -75,6 +76,7 @@ class AIKunClient(discord.Client):
     def __init__(self, settings: Settings, service: ChatService):
         intents = discord.Intents.default()
         intents.message_content = True
+        intents.members = True
         super().__init__(
             intents=intents,
             application_id=settings.discord.application_id,
@@ -87,6 +89,7 @@ class AIKunClient(discord.Client):
         self._history_tasks: set[asyncio.Task] = set()
         self._history_task_channels: dict[asyncio.Task, int] = {}
         self._history_loop_task: asyncio.Task | None = None
+        self._members_synced = False
         self.tree = RestrictedTree(self)
         self._register_commands()
 
@@ -98,12 +101,15 @@ class AIKunClient(discord.Client):
     async def on_ready(self) -> None:
         logger.info("Discord connected; configured guild commands ready")
         metrics.increment("ai_kun.discord_connections_total")
-        guild = self.get_guild(self.settings.discord.guild_id)
-        members = getattr(guild, "members", ()) if guild else ()
-        if members:
-            await asyncio.to_thread(
-                remember_users, self.settings.discord.guild_id, [sdk_user(user) for user in members]
-            )
+        if not self._members_synced:
+            try:
+                count = await sync_guild_members(
+                    self.settings.discord.guild_id, self.settings.discord.bot_token
+                )
+                logger.info("Discord member cache synced: members=%d", count)
+                self._members_synced = True
+            except Exception as exc:
+                logger.warning("Discord member cache sync failed: %s", type(exc).__name__)
         if self.settings.memory.enabled and (self._history_loop_task is None or self._history_loop_task.done()):
             self._history_loop_task = asyncio.create_task(self._history_loop())
 

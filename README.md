@@ -80,7 +80,7 @@ EMBEDDING_DIMENSION=768
 ## Discord側の設定
 
 1. [Developer Portal](https://discord.com/developers/applications)でApplicationとBotを作成し、トークンを設定します。
-2. **Bot → Privileged Gateway Intents → Message Content Intent** を有効にします。
+2. **Bot → Privileged Gateway Intents** で **Message Content Intent** と **Server Members Intent** を有効にします。Server Members Intentは起動時の全メンバー同期に使います。
 3. Guild Install用の招待URLに `bot` と `applications.commands` のスコープを含め、対象サーバーへ招待します。
 4. 対象チャンネルで「チャンネルを見る」「メッセージを送信」「メッセージ履歴を読む」を許可します。スレッドを使う場合は「スレッドでメッセージを送信」も必要です。
 5. Discordの開発者モードでサーバー・チャンネルIDをコピーし、`.env` に設定します。
