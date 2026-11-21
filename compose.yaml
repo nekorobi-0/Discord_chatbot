@@ -14,6 +14,7 @@ x-runtime: &runtime
     EMBEDDING_DIMENSION: "768"
   volumes:
     - bot-data:/app/data
+    - ./data/asr-model:/app/data/asr-model:ro
   init: true
   stop_grace_period: 30s
 

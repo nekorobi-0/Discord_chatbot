@@ -9,7 +9,7 @@
 - 設定サーバー内の全テキストチャンネルの過去ログを、稼働中のBotが自動で巻き戻し取り込み（手動CLI・専用サービスは廃止済み）
 - SQLiteへの保存と埋め込みキャッシュ、NumPyの行列演算を使ったコサイン類似度検索（1件ずつの純Python演算ではなく一括で計算）
 - Discordのチャンネル・発言・スレッドを読むMCPツールと、TavilyによるWeb検索（任意）
-- 添付音声のローカル文字起こし（任意、faster-whisperとモデルが必要）
+- 添付音声とVCのローカル文字起こし・話者別RAG保存（任意、faster-whisperとモデルが必要）
 - 連続ツール呼び出しの制限、メンション通知の抑止
 - 任意の接続状態・メトリクス確認用HTTPエンドポイント
 
@@ -237,7 +237,7 @@ Discordのスタンプも現在の投稿・返信チェーン・MCP取得結果�
 ## 音声文字起こし（任意）
 
 ```bash
-uv sync --locked --extra asr
+uv sync --locked --extra voice
 ```
 
 ダウンロード済みのCTranslate2形式Whisperモデル一式（`model.bin`、設定、トークナイザーなど）を `data/asr-model/` に置き、次の値を設定して再起動します。
@@ -250,9 +250,13 @@ ASR_COMPUTE_TYPE=int8
 ASR_LANGUAGE=ja
 ```
 
-`!ai` または先頭メンションとともに音声を1つ添付すると、文字起こしを質問に加えます。対応拡張子は `.ogg`, `.mp4`, `.webm`, `.mkv`, `.mp3`, `.wav`, `.m4a`, `.aac`, `.flac`, `.opus` です。上限8 MiB。VCに接続する機能ではありません。標準DockerイメージにはASR依存関係とモデルを含めていません。
+`!ai` または先頭メンションとともに音声を1つ添付すると、文字起こしを質問に加えます。対応拡張子は `.ogg`, `.mp4`, `.webm`, `.mkv`, `.mp3`, `.wav`, `.m4a`, `.aac`, `.flac`, `.opus` です。上限8 MiB。
 
-音声は一時ファイルとしてOSの一時領域へ書き、処理後に削除します。スレッドでの推論はタイムアウト後も完了まで続く場合があるため、短い音声を使ってください。
+VCで使う場合は `ASR_ENABLED=true` と `MEMORY_ENABLED=true` にし、Whisperモデルを `data/asr-model/` に配置してBotを再起動します。Docker Composeはこのホストディレクトリを読み取り専用でモデルパスへマウントします。サーバー管理権限のある利用者がVCに入って `/vc_stt_start` を実行すると開始し、`/vc_stt_stop` で停止します。開始時にテキストチャンネルへ告知し、認識結果も同チャンネルへ表示します。BotにはVCへの接続権限が必要です。話者ごとに無音で区切った音声をローカルWhisperで処理し、音声そのものは保存せず、話者ID・VC・日時を付けた文字起こしをRAGへ保存します。RAG検索ではVCと話者で絞り込めます。
+
+音声受信には [Discord DAVE対応の `discord-ext-voice-recv` fork](https://github.com/rdphillips7/discord-ext-voice-recv) をcommit固定で使います。受信拡張はalpha版なので、依存更新時はDiscordの音声プロトコル変更との互換性も確認してください。
+
+音声入力はメモリ上で処理し、ディスクへ音声ファイルを作りません。ASRモデルはメモリに読み込んで使い回します。
 
 ## データと運用
 

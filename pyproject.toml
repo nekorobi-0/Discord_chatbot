@@ -23,6 +23,12 @@ dependencies = [
 
 [project.optional-dependencies]
 asr = ["faster-whisper>=1.2,<2"]
+voice = [
+  "discord.py[voice]>=2.7.1,<3",
+  "discord-ext-voice-recv @ git+https://github.com/rdphillips7/discord-ext-voice-recv.git@e0cc062ee2fe10311ffacdd4a4d00de707d6b1a7",
+  "faster-whisper>=1.2,<2",
+  "audioop-lts>=0.2; python_version >= '3.13'",
+]
 dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "ruff>=0.12,<1"]
 
 [project.scripts]
@@ -30,6 +36,9 @@ ai-kun = "ai_kun.__main__:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["ai_kun"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

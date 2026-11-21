@@ -145,6 +145,13 @@ class ChatService:
     async def remember(self, content: str, *, channel_id: int | None = None) -> dict[str, int | str]:
         return await self.ingest_document("memory.txt", content.encode("utf-8"), channel_id=channel_id)
 
+    async def ingest_voice_transcript(self, channel_id: int, author: dict, timestamp, content: str):
+        if not self._settings.memory.enabled:
+            raise UpstreamError("記憶")
+        return await self._memory.ingest_voice_transcript(
+            self._settings.discord.guild_id, channel_id, author, timestamp, content
+        )
+
     async def ingest_message(self, message) -> dict[str, int]:
         """ライブの1発言をフック有無・内容に関係なくRAG記憶へ取り込む（問答無用）。"""
         author = getattr(message, "author", None)

@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import ipaddress
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 from collections.abc import Mapping, Sequence
@@ -108,6 +110,8 @@ class MemoryStore:
         self._llm = llm
         self._asr = asr
         self._memory = memory
+        self._asr_model = None
+        self._asr_lock = threading.Lock()
         self.ingestion = IngestionMonitor()
         self.ingestion_queue = WorkQueue()
         init_db()
@@ -351,31 +355,26 @@ class MemoryStore:
         return await asyncio.to_thread(self._transcribe_blocking, data)
 
     def _transcribe_blocking(self, data: bytes) -> str:
-        from faster_whisper import WhisperModel
-
         model_path = self._asr.model_path
         if not os.path.isfile(os.path.join(model_path, "model.bin")):
             logger.warning("ASR model assets missing")
             raise UpstreamError("音声認識")
 
-        import tempfile
-
-        with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as handle:
-            path = handle.name
         try:
-            with open(path, "wb") as sink:
-                sink.write(data)
-            model = WhisperModel(model_path, device=self._asr.device, compute_type=self._asr.compute_type)
-            segments, _info = model.transcribe(path, language=self._asr.language or None, vad_filter=True)
-            return _sanitize_text(" ".join(str(segment.text).strip() for segment in segments))
+            with self._asr_lock:
+                if self._asr_model is None:
+                    from faster_whisper import WhisperModel
+
+                    self._asr_model = WhisperModel(
+                        model_path, device=self._asr.device, compute_type=self._asr.compute_type
+                    )
+                segments, _info = self._asr_model.transcribe(
+                    io.BytesIO(data), language=self._asr.language or None, vad_filter=True
+                )
+                return _sanitize_text(" ".join(str(segment.text).strip() for segment in segments))
         except Exception as exc:
             logger.warning("asr failed: %s", type(exc).__name__)
             raise UpstreamError("音声認識") from exc
-        finally:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
 
     # ---------- 資料の取り込み ----------
     def read_document(self, filename: str | None, data: bytes, *, content_type: str | None = None) -> str:
@@ -410,6 +409,96 @@ class MemoryStore:
             return result
 
         return await self.ingestion_queue.submit(operation)
+
+    async def ingest_voice_transcript(
+        self,
+        guild_id: int,
+        channel_id: int,
+        author: dict,
+        timestamp: datetime,
+        content: str,
+    ) -> dict[str, int | str]:
+        """Store one speaker-attributed voice transcript with normal guild/channel/user filters."""
+        job = self.ingestion.start(guild_id, channel_id, "voice_transcript", 1, queued=True)
+
+        async def operation():
+            self.ingestion.running(job)
+            try:
+                if not self._memory.enabled:
+                    raise UpstreamError("記憶")
+                user_id = str(author.get("id", ""))
+                if not user_id.isdigit() or not 5 <= len(user_id) <= 25:
+                    raise InvalidInputError("話者を確認できませんでした。")
+                text = _sanitize_text(content)[: self._memory.max_chars_per_document]
+                if not text:
+                    return {"chunks": 0, "document_id": "", "imported": 0}
+                if timestamp.tzinfo is None:
+                    raise InvalidInputError("音声区間の日時が不正です。")
+                await asyncio.to_thread(remember_users, guild_id, [author])
+                line = f"[{timestamp.astimezone(UTC).isoformat()}] member-{user_id}: {text}"
+                chunks = []
+                step = max(1, self._memory.chunk_size - self._memory.chunk_overlap)
+                for start in range(0, len(line), step):
+                    piece = line[start : start + self._memory.chunk_size]
+                    if piece.strip():
+                        chunks.append(piece)
+                    if start + self._memory.chunk_size >= len(line):
+                        break
+                vectors = await self.embed(chunks)
+                document_id = uuid.uuid4().hex
+                message_id = f"voice:{uuid.uuid4().hex}"
+                now = datetime.now(UTC)
+                with Session(get_engine()) as session:
+                    session.add(
+                        MemoryDocumentRecord(
+                            document_id=document_id,
+                            source="discord_voice",
+                            title=f"voice channel:{channel_id}",
+                            content=line,
+                            created_at=now,
+                        )
+                    )
+                    session.flush()
+                    for piece, vector in zip(chunks, vectors, strict=True):
+                        session.add(
+                            MemoryChunkRecord(
+                                chunk_id=uuid.uuid4().hex,
+                                document_id=document_id,
+                                content=piece,
+                                embedding=_encode_vector(vector),
+                                model=self._embedding.model,
+                                dimension=self._embedding.dimension,
+                                created_at=now,
+                            )
+                        )
+                    session.add(
+                        HistoryMessageRecord(
+                            message_id=message_id,
+                            guild_id=str(guild_id),
+                            channel_id=str(channel_id),
+                            document_id=document_id,
+                        )
+                    )
+                    session.add(
+                        HistoryMessageSpanRecord(
+                            message_id=message_id,
+                            document_id=document_id,
+                            author_id=user_id,
+                            start=0,
+                            end=len(line),
+                        )
+                    )
+                    session.commit()
+                return {"chunks": len(chunks), "document_id": document_id, "imported": 1}
+            except BaseException as exc:
+                self.ingestion.finish(job, error=type(exc).__name__)
+                raise
+        async def tracked_operation():
+            result = await operation()
+            self.ingestion.finish(job, result={"documents": result["imported"], "chunks": result["chunks"]})
+            return result
+
+        return await self.ingestion_queue.submit(tracked_operation)
 
     async def _ingest_document(self, filename: str | None, data: bytes) -> dict[str, int | str]:
         if not self._memory.enabled:
@@ -769,7 +858,9 @@ class MemoryStore:
                     origin_query = origin_query.where(HistoryMessageRecord.message_id == message_id)
                 origin = session.exec(origin_query).first()
             label = f"document:{row.document_id}"
-            if origin:
+            if origin and origin.message_id.startswith("voice:"):
+                label += f" voice channel:{origin.channel_id}"
+            elif origin:
                 label += f" https://discord.com/channels/{origin.guild_id}/{origin.channel_id}/{origin.message_id}"
             results.append(RetrievedChunk(label=label, text=fragment))
             if len(results) >= limit:

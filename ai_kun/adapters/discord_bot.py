@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -86,6 +87,9 @@ class AIKunClient(discord.Client):
         self.service = service
         self._response_queue = WorkQueue()
         self._parallel_responses: set[asyncio.Task] = set()
+        self._voice_sessions = {}
+        self._voice_starting: set[int] = set()
+        self._voice_notice_channels = {}
         self._message_tasks: set[asyncio.Task] = set()
         self._history_tasks: set[asyncio.Task] = set()
         self._history_task_channels: dict[asyncio.Task, int] = {}
@@ -271,6 +275,8 @@ class AIKunClient(discord.Client):
             await asyncio.gather(*self._message_tasks, return_exceptions=True)
         if self._history_tasks:
             await asyncio.gather(*self._history_tasks, return_exceptions=True)
+        for guild_id in list(self._voice_sessions):
+            await self._stop_voice_stt(guild_id, announce=False)
         if self._parallel_responses:
             await asyncio.gather(*tuple(self._parallel_responses), return_exceptions=True)
         await self._response_queue.join()
@@ -377,6 +383,119 @@ class AIKunClient(discord.Client):
                 return f"削除しました（{count}チャンク）。"
 
             await self._answer(interaction, operation, ephemeral=True)
+
+        @self.tree.command(name="vc_stt_start", description="今いるVCの音声を文字起こししてRAGへ保存する（管理者）")
+        @app_commands.default_permissions(manage_guild=True)
+        @app_commands.checks.has_permissions(manage_guild=True)
+        async def vc_stt_start(interaction: discord.Interaction):
+            if not self.settings.asr.enabled:
+                await interaction.response.send_message("ASR_ENABLED=true が必要です。", ephemeral=True)
+                return
+            if not self.settings.memory.enabled:
+                await interaction.response.send_message("RAG記憶が無効です。", ephemeral=True)
+                return
+            if not os.path.isfile(os.path.join(self.settings.asr.model_path, "model.bin")):
+                await interaction.response.send_message("Whisperモデルが見つかりません。", ephemeral=True)
+                return
+            voice_state = getattr(interaction.user, "voice", None)
+            channel = getattr(voice_state, "channel", None)
+            if not isinstance(channel, discord.VoiceChannel):
+                await interaction.response.send_message("先に通常のVCへ入ってから実行してください。", ephemeral=True)
+                return
+            guild = interaction.guild
+            if guild.id in self._voice_sessions or guild.id in self._voice_starting:
+                await interaction.response.send_message("このサーバーではVC文字起こしがすでに動いています。", ephemeral=True)
+                return
+            if guild.voice_client is not None:
+                await interaction.response.send_message("Botはすでに別のVCセッションを使用中です。", ephemeral=True)
+                return
+            me = guild.me
+            if me is None or not channel.permissions_for(me).connect:
+                await interaction.response.send_message("BotにVCの接続権限がありません。", ephemeral=True)
+                return
+            try:
+                from discord.ext import voice_recv
+
+                from ..voice_stt import VoiceTranscriptSession
+            except ImportError:
+                await interaction.response.send_message("音声受信依存がありません。voice extraを入れてください。", ephemeral=True)
+                return
+
+            self._voice_starting.add(guild.id)
+            notice_channel = interaction.channel
+            try:
+                await interaction.response.defer(ephemeral=True)
+                await notice_channel.send(
+                    "🎙️ VC文字起こしを開始します。音声はローカルWhisperで処理し、音声ファイルは保存せず、"
+                    "話者別の文字起こしをRAG記憶へ登録します。停止は `/vc_stt_stop`。"
+                )
+                voice_client = await channel.connect(cls=voice_recv.VoiceRecvClient)
+
+                async def announce_transcript(author: dict, text: str):
+                    name = author.get("nick") or author.get("global_name") or author.get("username") or "メンバー"
+                    name = str(name).replace("@", "@\u200b")[:80]
+                    for part in split_message(text):
+                        await notice_channel.send(
+                            f"🎙️ **{name}**: {part}", allowed_mentions=discord.AllowedMentions.none()
+                        )
+
+                session = VoiceTranscriptSession(voice_client, self.service, guild.id, channel.id, announce_transcript)
+                await session.start()
+                self._voice_sessions[guild.id] = session
+                self._voice_notice_channels[guild.id] = notice_channel
+                await interaction.followup.send(f"{channel.mention} の文字起こしを開始しました。", ephemeral=True)
+            except Exception as exc:
+                logger.warning("VC STT start failed: %s", type(exc).__name__)
+                current = guild.voice_client
+                if current is not None and current.is_connected():
+                    await current.disconnect(force=True)
+                await interaction.followup.send("VCへ接続できませんでした。Botの接続権限を確認してください。", ephemeral=True)
+            finally:
+                self._voice_starting.discard(guild.id)
+
+        @self.tree.command(name="vc_stt_stop", description="VC文字起こしを停止して未処理分をRAGへ保存する（管理者）")
+        @app_commands.default_permissions(manage_guild=True)
+        @app_commands.checks.has_permissions(manage_guild=True)
+        async def vc_stt_stop(interaction: discord.Interaction):
+            await interaction.response.defer(ephemeral=True)
+            if await self._stop_voice_stt(interaction.guild_id):
+                await interaction.followup.send("VC文字起こしを停止しました。未処理分もRAGへ保存しました。", ephemeral=True)
+            else:
+                await interaction.followup.send("VC文字起こしは動いていません。", ephemeral=True)
+
+    async def _stop_voice_stt(self, guild_id: int | None, *, announce: bool = True) -> bool:
+        if guild_id is None:
+            return False
+        session = self._voice_sessions.pop(guild_id, None)
+        notice_channel = self._voice_notice_channels.pop(guild_id, None)
+        if session is None:
+            return False
+        try:
+            await session.stop()
+        finally:
+            voice_client = session.voice_client
+            if voice_client.is_connected():
+                await voice_client.disconnect(force=True)
+        if announce and notice_channel is not None:
+            try:
+                await notice_channel.send("⏹️ VC文字起こしを停止しました。文字起こしはRAG記憶に保存済みです。")
+            except Exception as exc:
+                logger.warning("VC STT stop announcement failed: %s", type(exc).__name__)
+        return True
+
+    async def on_voice_state_update(self, member, before, after) -> None:
+        guild_id = getattr(getattr(member, "guild", None), "id", None)
+        session = self._voice_sessions.get(guild_id)
+        if session is None:
+            return
+        if self.user is not None and member.id == self.user.id and after.channel is None:
+            await self._stop_voice_stt(guild_id, announce=True)
+            return
+        voice_channel = session.voice_client.channel
+        if before.channel is voice_channel and after.channel is not voice_channel:
+            await asyncio.sleep(0.5)
+            if not any(not participant.bot for participant in voice_channel.members):
+                await self._stop_voice_stt(guild_id, announce=True)
 
     async def on_message(self, message: discord.Message) -> None:
         task = asyncio.current_task()
