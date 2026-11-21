@@ -259,6 +259,17 @@ VCで使う場合は `ASR_ENABLED=true` と `MEMORY_ENABLED=true` にし、Bot�
 
 音声入力はメモリ上で処理し、ディスクへ音声ファイルを作りません。ASRモデルはメモリに読み込んで使い回します。
 
+### VC合言葉TTS
+
+`VC_TTS_TRIGGER` に設定した文字列の後ろに質問を書いて対象サーバーのチャットへ送ると、Botが通常のRAG回答を生成し、投稿者の通常VCへ接続して返答を読み上げて退出します。`VC_TTS_VOICE` はEdge TTSの音声名（既定 `ja-JP-NanamiNeural`）です。空のトリガーでは無効です。BotにVCの接続・発言権限が必要で、回答文をMicrosoft Edge TTSへ送信します。再生に `ffmpeg` を使います。ASRでVC接続中なら、同じVCで読み上げた後もSTTを継続します。
+
+```dotenv
+VC_TTS_TRIGGER=おはようAIくん
+VC_TTS_VOICE=ja-JP-NanamiNeural
+```
+
+例: `おはようAIくん 今日の予定を教えて` と送ると、「今日の予定を教えて」を通常の質問として回答して読み上げます。
+
 ## データと運用
 
 `DATA_DIR`（既定 `./data`）に以下を保存します。

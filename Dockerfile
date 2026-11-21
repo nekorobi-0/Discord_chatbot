@@ -5,7 +5,7 @@ RUN useradd --create-home --uid 10001 bot
 COPY pyproject.toml README.md ./
 COPY ai_kun ./ai_kun
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git \
+    && apt-get install -y --no-install-recommends git ffmpeg \
     && pip install --no-cache-dir '.[voice]' \
     && python -c "from ai_kun.text_files import file_encoding; file_encoding()" \
     && mkdir -p /app/data \

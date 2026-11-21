@@ -1,6 +1,7 @@
 """許可したギルド・チャンネルだけで動く Discord アダプター。"""
 
 import asyncio
+import io
 import logging
 import time
 import uuid
@@ -88,6 +89,7 @@ class AIKunClient(discord.Client):
         self._parallel_responses: set[asyncio.Task] = set()
         self._voice_sessions = {}
         self._voice_starting: set[int] = set()
+        self._voice_tts_locks: dict[int, asyncio.Lock] = {}
         self._voice_notice_channels = {}
         self._message_tasks: set[asyncio.Task] = set()
         self._history_tasks: set[asyncio.Task] = set()
@@ -578,6 +580,14 @@ class AIKunClient(discord.Client):
         # 取得要求はすべて受け付けるが、返信は過去ログ取得の完了を待たない。
         self._schedule_backfill(message.channel.id)
 
+        trigger = self.settings.voice_tts.trigger
+        trigger_index = message.content.casefold().find(trigger.casefold()) if trigger else -1
+        if trigger_index >= 0:
+            prompt = message.content[trigger_index + len(trigger) :].lstrip(" \t\r\n:：,、")
+            if prompt:
+                await self._speak_tts_in_author_vc(message, prompt)
+            return
+
         content = message.content.strip()
         reply_target, reply_stop = await resolve_reply(message, message.channel, message.guild.id)
         is_bot_reply = (
@@ -633,6 +643,88 @@ class AIKunClient(discord.Client):
             prose_limit=self.settings.operational.max_output_chars,
         )
         await self._run(operation, request_id=request_id, publisher=publisher)
+
+    async def _speak_tts_in_author_vc(self, message: discord.Message, prompt: str) -> None:
+        guild = message.guild
+        state = getattr(message.author, "voice", None)
+        channel = getattr(state, "channel", None)
+        if guild is None or not isinstance(channel, discord.VoiceChannel):
+            return
+        lock = self._voice_tts_locks.setdefault(guild.id, asyncio.Lock())
+        if lock.locked():
+            return
+
+        async with lock:
+            voice_client = guild.voice_client
+            disconnect_after = False
+            try:
+                voice = self.settings.voice_tts.voice
+
+                async def operation():
+                    async with self._typing(message.channel):
+                        phase("reply_chain")
+                        target, stop = await resolve_reply(message, message.channel, guild.id)
+                        context = await collect_reply_chain(message, target, stop)
+                        phase("attachments")
+                        answer = await self.service.generate_reply(
+                            prompt,
+                            channel_id=message.channel.id,
+                            discord_context=context,
+                        )
+                        return answer.content
+
+                text = str(await self._run(operation, request_id=str(message.id))).strip()
+                if not text:
+                    return
+                from edge_tts import Communicate
+
+                audio = bytearray()
+                async for chunk in Communicate(text, voice).stream():
+                    if chunk.get("type") == "audio":
+                        audio.extend(chunk["data"])
+                        if len(audio) > 8 * 1024 * 1024:
+                            raise ValueError("TTS audio exceeded size limit")
+                if not audio:
+                    raise ValueError("TTS returned no audio")
+
+                if voice_client is not None and voice_client.is_connected():
+                    if getattr(voice_client, "channel", None) != channel:
+                        logger.info("VC TTS skipped: bot is connected to a different channel")
+                        return
+                else:
+                    me = guild.me
+                    permissions = channel.permissions_for(me) if me else None
+                    if permissions is None or not permissions.connect or not permissions.speak:
+                        logger.info("VC TTS skipped: bot lacks connect or speak permission")
+                        return
+                    voice_client = await channel.connect()
+                    disconnect_after = True
+
+                loop = asyncio.get_running_loop()
+                finished = loop.create_future()
+
+                def after_playback(error):
+                    def complete():
+                        if finished.done():
+                            return
+                        if error:
+                            finished.set_exception(error)
+                        else:
+                            finished.set_result(None)
+
+                    loop.call_soon_threadsafe(complete)
+
+                source = discord.FFmpegPCMAudio(io.BytesIO(bytes(audio)), pipe=True)
+                voice_client.play(source, after=after_playback)
+                await asyncio.wait_for(finished, timeout=600)
+            except Exception as exc:
+                logger.warning("VC TTS failed: %s", type(exc).__name__)
+            finally:
+                if disconnect_after and voice_client is not None and voice_client.is_connected():
+                    try:
+                        await voice_client.disconnect(force=True)
+                    except Exception as exc:
+                        logger.warning("VC TTS disconnect failed: %s", type(exc).__name__)
 
     async def _process_attachments(
         self, content: str, attachments, channel_id: int, *, discord_context: DiscordContext | None = None

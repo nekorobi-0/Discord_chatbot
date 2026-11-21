@@ -250,6 +250,21 @@ class ASRSettings:
 
 
 @dataclass(frozen=True)
+class VoiceTTSSettings:
+    """VCでの合言葉付きAI応答読み上げ。trigger未設定なら無効。"""
+
+    trigger: str = field(repr=False, default="")
+    voice: str = "ja-JP-NanamiNeural"
+
+    @classmethod
+    def from_env(cls) -> VoiceTTSSettings:
+        return cls(
+            trigger=_secret("VC_TTS_TRIGGER"),
+            voice=_raw("VC_TTS_VOICE") or "ja-JP-NanamiNeural",
+        )
+
+
+@dataclass(frozen=True)
 class SearchSettings:
     """Web 検索ツール。キーが無ければツールは安全に停止する。"""
 
@@ -335,6 +350,7 @@ class Settings:
     search: SearchSettings
     memory: MemorySettings
     operational: OperationalSettings
+    voice_tts: VoiceTTSSettings = field(default_factory=VoiceTTSSettings)
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -343,6 +359,7 @@ class Settings:
             llm=LLMSettings.from_env(),
             embedding=EmbeddingSettings.from_env() if _bool("MEMORY_ENABLED", True) else EmbeddingSettings(),
             asr=ASRSettings.from_env(),
+            voice_tts=VoiceTTSSettings.from_env(),
             search=SearchSettings.from_env(),
             memory=MemorySettings.from_env(),
             operational=OperationalSettings.from_env(),
