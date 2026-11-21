@@ -474,7 +474,7 @@ class AIKunClient(discord.Client):
                         )
 
                 session = VoiceTranscriptSession(voice_client, self.service, guild.id, channel.id, announce_transcript)
-                await session.start()
+                await session.start(workers=self.settings.asr.workers)
                 self._voice_sessions[guild.id] = session
                 self._voice_notice_channels[guild.id] = notice_channel
                 await interaction.followup.send(f"{channel.mention} の文字起こしを開始しました。", ephemeral=True)

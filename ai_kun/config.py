@@ -236,6 +236,8 @@ class ASRSettings:
     device: str = "cpu"
     compute_type: str = "int8"
     language: str = "ja"
+    cpu_threads: int = 8
+    workers: int = 2
 
     @classmethod
     def from_env(cls) -> ASRSettings:
@@ -246,6 +248,8 @@ class ASRSettings:
             device="cuda" if _raw("ASR_DEVICE").lower().startswith("cuda") else "cpu",
             compute_type=_raw("ASR_COMPUTE_TYPE") or "int8",
             language=(_raw("ASR_LANGUAGE") or "ja")[:8],
+            cpu_threads=_int("ASR_CPU_THREADS", 8, 1, 32),
+            workers=_int("ASR_WORKERS", 2, 1, 8),
         )
 
 

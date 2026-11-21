@@ -1,4 +1,4 @@
-"""Receive Discord voice audio, split it by speaker and silence, and store local STT in RAG."""
+"""Receive Discord voice audio, split it by speaking state, and store local STT in RAG."""
 
 from __future__ import annotations
 
@@ -6,9 +6,7 @@ import asyncio
 import io
 import logging
 import threading
-import time
 import wave
-from array import array
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Callable
@@ -38,8 +36,6 @@ class _SpeakerBuffer:
     author: dict
     pcm: bytearray
     started_at: datetime
-    last_voice_at: float
-    trailing_silence_bytes: int = 0
 
 
 if voice_recv is not None:
@@ -50,18 +46,11 @@ if voice_recv is not None:
             self._emit = emit
             self._max_bytes = BYTES_PER_SECOND * max_seconds
             self._buffers: dict[int, _SpeakerBuffer] = {}
+            self._speaking: set[int] = set()
             self._lock = threading.RLock()
 
         def wants_opus(self) -> bool:
             return False
-
-        @staticmethod
-        def _rms(pcm: bytes) -> float:
-            samples = array("h")
-            samples.frombytes(pcm[: len(pcm) - len(pcm) % SAMPLE_WIDTH])
-            if not samples:
-                return 0.0
-            return (sum(sample * sample for sample in samples) / len(samples)) ** 0.5
 
         @staticmethod
         def _author(user) -> dict:
@@ -74,9 +63,36 @@ if voice_recv is not None:
 
         def _take(self, user_id: int) -> VoiceSegment | None:
             state = self._buffers.pop(user_id, None)
-            if state is None or len(state.pcm) < BYTES_PER_SECOND * 0.35:
+            if state is None or len(state.pcm) < BYTES_PER_SECOND * 0.22:
                 return None
             return VoiceSegment(bytes(state.pcm), state.author, state.started_at)
+
+        @voice_recv.AudioSink.listener("voice_member_speaking_start")
+        def on_voice_member_speaking_start(self, user) -> None:
+            if user is None or getattr(user, "bot", False):
+                return
+            author = self._author(user)
+            if not author["id"].isdigit():
+                return
+            user_id = int(author["id"])
+            with self._lock:
+                self._speaking.add(user_id)
+                self._buffers.setdefault(
+                    user_id,
+                    _SpeakerBuffer(author, bytearray(), datetime.now(UTC)),
+                )
+
+        @voice_recv.AudioSink.listener("voice_member_speaking_stop")
+        def on_voice_member_speaking_stop(self, user) -> None:
+            user_id = getattr(user, "id", None)
+            if user_id is None:
+                return
+            segment = None
+            with self._lock:
+                self._speaking.discard(int(user_id))
+                segment = self._take(int(user_id))
+            if segment is not None:
+                self._emit(segment)
 
         def write(self, user, data) -> None:
             if user is None or getattr(user, "bot", False) or data.pcm is None:
@@ -84,43 +100,33 @@ if voice_recv is not None:
             author = self._author(user)
             if not author["id"].isdigit():
                 return
-            now = time.monotonic()
             pcm = bytes(data.pcm)
-            loud = self._rms(pcm) >= 240
-            segment = None
             user_id = int(author["id"])
+            segments = []
             with self._lock:
+                if user_id not in self._speaking:
+                    return
                 state = self._buffers.get(user_id)
-                if loud:
-                    if state is None:
-                        state = _SpeakerBuffer(author, bytearray(), datetime.now(UTC), now)
-                        self._buffers[user_id] = state
-                    state.author = author
-                    state.last_voice_at = now
-                    state.trailing_silence_bytes = 0
-                    state.pcm.extend(pcm)
-                elif state is not None:
-                    next_silence = state.trailing_silence_bytes + len(pcm)
-                    if next_silence <= BYTES_PER_SECOND // 4:
-                        state.pcm.extend(pcm)
-                        state.trailing_silence_bytes = next_silence
-                if state is not None and len(state.pcm) >= self._max_bytes:
+                if state is None:
+                    state = _SpeakerBuffer(author, bytearray(), datetime.now(UTC))
+                    self._buffers[user_id] = state
+                state.author = author
+                state.pcm.extend(pcm)
+                while len(state.pcm) >= self._max_bytes:
                     segment = self._take(user_id)
-            if segment is not None:
+                    if segment is not None:
+                        segments.append(segment)
+                    if user_id in self._speaking:
+                        state = _SpeakerBuffer(author, bytearray(), datetime.now(UTC))
+                        self._buffers[user_id] = state
+                    else:
+                        break
+            for segment in segments:
                 self._emit(segment)
-
-        def flush_idle(self, *, idle_seconds: float = 1.2) -> list[VoiceSegment]:
-            now = time.monotonic()
-            with self._lock:
-                return [
-                    segment
-                    for user_id, state in list(self._buffers.items())
-                    if now - state.last_voice_at >= idle_seconds
-                    if (segment := self._take(user_id)) is not None
-                ]
 
         def flush_all(self) -> list[VoiceSegment]:
             with self._lock:
+                self._speaking.clear()
                 return [segment for user_id in list(self._buffers) if (segment := self._take(user_id)) is not None]
 
         def cleanup(self) -> None:
@@ -150,19 +156,20 @@ class VoiceTranscriptSession:
         self.sink = _TranscriptSink(self._emit)
         self._stopping = False
         self._reader_stopped = self.loop.create_future()
-        self._worker: asyncio.Task | None = None
-        self._flusher: asyncio.Task | None = None
+        self._workers: list[asyncio.Task] = []
 
-    async def start(self) -> None:
-        self._worker = asyncio.create_task(self._consume(), name=f"voice-stt-{self.guild_id}")
-        self._flusher = asyncio.create_task(self._flush_loop(), name=f"voice-stt-flush-{self.guild_id}")
+    async def start(self, *, workers: int = 2) -> None:
+        self._workers = [
+            asyncio.create_task(self._consume(), name=f"voice-stt-{self.guild_id}-{index + 1}")
+            for index in range(max(1, workers))
+        ]
         try:
             self.voice_client.listen(self.sink, after=self._after)
         except Exception:
             self._stopping = True
-            self._flusher.cancel()
-            self._worker.cancel()
-            await asyncio.gather(self._flusher, self._worker, return_exceptions=True)
+            for worker in self._workers:
+                worker.cancel()
+            await asyncio.gather(*self._workers, return_exceptions=True)
             raise
 
     def _emit(self, segment: VoiceSegment) -> None:
@@ -178,12 +185,6 @@ class VoiceTranscriptSession:
             self.queue.put_nowait(segment)
         except asyncio.QueueFull:
             logger.warning("voice transcript queue full; dropping segment channel=%s", self.channel_id)
-
-    async def _flush_loop(self) -> None:
-        while not self._stopping:
-            await asyncio.sleep(0.4)
-            for segment in self.sink.flush_idle():
-                self._enqueue(segment)
 
     def _after(self, error: Exception | None) -> None:
         if error:
@@ -247,15 +248,13 @@ class VoiceTranscriptSession:
             except TimeoutError:
                 logger.warning("voice receive stop timed out: channel=%s", self.channel_id)
         self._stopping = True
-        if self._flusher is not None:
-            self._flusher.cancel()
-            await asyncio.gather(self._flusher, return_exceptions=True)
         for segment in self.sink.flush_all():
             self._enqueue_before_stop(segment)
         await self.queue.join()
-        if self._worker is not None:
-            await self.queue.put(None)
-            await self._worker
+        if self._workers:
+            for _worker in self._workers:
+                await self.queue.put(None)
+            await asyncio.gather(*self._workers, return_exceptions=True)
 
     def _enqueue_before_stop(self, segment: VoiceSegment) -> None:
         try:

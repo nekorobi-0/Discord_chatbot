@@ -368,6 +368,8 @@ class MemoryStore:
                     self._asr.model,
                     device=self._asr.device,
                     compute_type=self._asr.compute_type,
+                    cpu_threads=self._asr.cpu_threads,
+                    num_workers=self._asr.workers,
                     download_root=self._asr.model_path,
                 )
             return self._asr_model
@@ -375,11 +377,24 @@ class MemoryStore:
     def _transcribe_blocking(self, data: bytes) -> str:
         try:
             model = self._load_asr_model()
-            with self._asr_lock:
-                segments, _info = model.transcribe(
-                    io.BytesIO(data), language=self._asr.language or None, vad_filter=True
-                )
-                return _sanitize_text(" ".join(str(segment.text).strip() for segment in segments))
+            segments, _info = model.transcribe(
+                io.BytesIO(data),
+                language=self._asr.language or None,
+                vad_filter=True,
+                no_speech_threshold=0.5,
+                log_prob_threshold=-0.9,
+                compression_ratio_threshold=2.2,
+                condition_on_previous_text=False,
+            )
+            accepted = [
+                str(segment.text).strip()
+                for segment in segments
+                if segment.text.strip()
+                and segment.no_speech_prob < 0.5
+                and segment.avg_logprob >= -0.9
+                and segment.compression_ratio <= 2.2
+            ]
+            return _sanitize_text(" ".join(accepted))
         except Exception as exc:
             logger.warning("asr failed: %s", type(exc).__name__)
             raise UpstreamError("音声認識") from exc

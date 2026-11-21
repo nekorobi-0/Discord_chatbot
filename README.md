@@ -249,11 +249,13 @@ ASR_MODEL=Systran/faster-whisper-small
 ASR_DEVICE=cpu
 ASR_COMPUTE_TYPE=int8
 ASR_LANGUAGE=ja
+ASR_CPU_THREADS=8
+ASR_WORKERS=2
 ```
 
 `!ai` または先頭メンションとともに音声を1つ添付すると、文字起こしを質問に加えます。対応拡張子は `.ogg`, `.mp4`, `.webm`, `.mkv`, `.mp3`, `.wav`, `.m4a`, `.aac`, `.flac`, `.opus` です。上限8 MiB。
 
-VCで使う場合は `ASR_ENABLED=true` と `MEMORY_ENABLED=true` にし、Botを起動します。Docker Composeの永続データ領域にモデルをキャッシュします。サーバー管理権限のある利用者がVCに入って `/vc_stt_start` を実行すると開始し、`/vc_stt_stop` で停止します。開始時にテキストチャンネルへ告知し、認識結果も同チャンネルへ表示します。BotにはVCへの接続権限が必要です。話者ごとに無音で区切った音声をローカルWhisperで処理し、音声そのものは保存せず、話者ID・VC・日時を付けた文字起こしをRAGへ保存します。RAG検索ではVCと話者で絞り込めます。
+VCで使う場合は `ASR_ENABLED=true` と `MEMORY_ENABLED=true` にし、Botを起動します。Docker Composeの永続データ領域にモデルをキャッシュします。サーバー管理権限のある利用者がVCに入って `/vc_stt_start` を実行すると開始し、`/vc_stt_stop` で停止します。開始時にテキストチャンネルへ告知し、認識結果も同チャンネルへ表示します。BotにはVCへの接続権限が必要です。Discordの話者ごとの発話開始・終了イベントを境界に音声を分け、16秒を超える発話は途中で分割してローカルWhisperで処理します。音声そのものは保存せず、話者ID・VC・日時を付けた文字起こしをRAGへ保存します。`ASR_CPU_THREADS` と `ASR_WORKERS` で推論のCPUスレッド数と同時ワーカー数を調整できます。RAG検索ではVCと話者で絞り込めます。
 
 音声受信には [Discord DAVE対応の `discord-ext-voice-recv` fork](https://github.com/rdphillips7/discord-ext-voice-recv) をcommit固定で使います。受信拡張はalpha版なので、依存更新時はDiscordの音声プロトコル変更との互換性も確認してください。
 
