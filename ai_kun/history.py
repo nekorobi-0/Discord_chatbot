@@ -236,11 +236,27 @@ async def backfill_channel(settings, store, channel_id: int, *, api=None) -> dic
     """走査専用カーソルから古い順に読む。旧版のライブ観測位置は信用しない。"""
     totals = {"scanned": 0, "imported": 0, "skipped": 0, "documents": 0}
     key = f"{settings.discord.guild_id}:{channel_id}"
-    # 自動バックフィルも単独実行だけ。二重起動はカーソルを進めず、取り込みを重複させない。
-    with importer_lock():
+
+    def load_checkpoint() -> int:
         with Session(get_engine()) as session:
             checkpoint = session.get(HistoryScanCursorRecord, key)
-            cursor = int(checkpoint.last_message_id) if checkpoint else 0
+            return int(checkpoint.last_message_id) if checkpoint else 0
+
+    def save_checkpoint(cursor: int) -> None:
+        with Session(get_engine()) as session:
+            checkpoint = session.get(HistoryScanCursorRecord, key)
+            if checkpoint is None:
+                checkpoint = HistoryScanCursorRecord(channel_key=key, last_message_id=str(cursor))
+            else:
+                checkpoint.last_message_id = str(cursor)
+            session.add(checkpoint)
+            session.commit()
+
+    # 自動バックフィルも単独実行だけ。二重起動はカーソルを進めず、取り込みを重複させない。
+    with importer_lock():
+        # SQLAlchemyの同期接続取得はpool満杯時にスレッドを待たせるため、
+        # Discordのasyncioイベントループから切り離す。
+        cursor = await asyncio.to_thread(load_checkpoint)
         async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
             api = api or DiscordHistoryAPI(settings.discord.bot_token, client, shared_limiter)
             channel = await api.get(channel_id)
@@ -258,14 +274,7 @@ async def backfill_channel(settings, store, channel_id: int, *, api=None) -> dic
                 result = await store.ingest_history_page(settings.discord.guild_id, channel_id, eligible)
                 cursor = int(eligible[-1]["id"])
                 # 保存に成功したページだけ確定。ライブ投入の最新IDは参照しない。
-                with Session(get_engine()) as session:
-                    checkpoint = session.get(HistoryScanCursorRecord, key)
-                    if checkpoint is None:
-                        checkpoint = HistoryScanCursorRecord(channel_key=key, last_message_id=str(cursor))
-                    else:
-                        checkpoint.last_message_id = str(cursor)
-                    session.add(checkpoint)
-                    session.commit()
+                await asyncio.to_thread(save_checkpoint, cursor)
                 for name in totals:
                     totals[name] += result[name]
                 logger.info(
