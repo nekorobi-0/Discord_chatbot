@@ -13,7 +13,6 @@ import hashlib
 import io
 import ipaddress
 import logging
-import os
 import re
 import threading
 import time
@@ -354,21 +353,30 @@ class MemoryStore:
             raise InvalidInputError("この音声はうまく扱えなかったよ。")
         return await asyncio.to_thread(self._transcribe_blocking, data)
 
+    async def prepare_asr_model(self) -> None:
+        """ASR有効時にモデルを取得して常駐させる。"""
+        if not self._asr.enabled:
+            return
+        await asyncio.to_thread(self._load_asr_model)
+
+    def _load_asr_model(self):
+        with self._asr_lock:
+            if self._asr_model is None:
+                from faster_whisper import WhisperModel
+
+                self._asr_model = WhisperModel(
+                    self._asr.model,
+                    device=self._asr.device,
+                    compute_type=self._asr.compute_type,
+                    download_root=self._asr.model_path,
+                )
+            return self._asr_model
+
     def _transcribe_blocking(self, data: bytes) -> str:
-        model_path = self._asr.model_path
-        if not os.path.isfile(os.path.join(model_path, "model.bin")):
-            logger.warning("ASR model assets missing")
-            raise UpstreamError("音声認識")
-
         try:
+            model = self._load_asr_model()
             with self._asr_lock:
-                if self._asr_model is None:
-                    from faster_whisper import WhisperModel
-
-                    self._asr_model = WhisperModel(
-                        model_path, device=self._asr.device, compute_type=self._asr.compute_type
-                    )
-                segments, _info = self._asr_model.transcribe(
+                segments, _info = model.transcribe(
                     io.BytesIO(data), language=self._asr.language or None, vad_filter=True
                 )
                 return _sanitize_text(" ".join(str(segment.text).strip() for segment in segments))
@@ -493,6 +501,7 @@ class MemoryStore:
             except BaseException as exc:
                 self.ingestion.finish(job, error=type(exc).__name__)
                 raise
+
         async def tracked_operation():
             result = await operation()
             self.ingestion.finish(job, result={"documents": result["imported"], "chunks": result["chunks"]})

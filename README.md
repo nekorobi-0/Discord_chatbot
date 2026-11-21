@@ -240,11 +240,12 @@ Discordのスタンプも現在の投稿・返信チェーン・MCP取得結果�
 uv sync --locked --extra voice
 ```
 
-ダウンロード済みのCTranslate2形式Whisperモデル一式（`model.bin`、設定、トークナイザーなど）を `data/asr-model/` に置き、次の値を設定して再起動します。
+`ASR_ENABLED=true` にして起動すると、初回起動時に `ASR_MODEL` をHugging Faceから `ASR_MODEL_PATH` へダウンロードします。次回以降は保存済みモデルを使います。標準モデルは `Systran/faster-whisper-small` です。
 
 ```dotenv
 ASR_ENABLED=true
 ASR_MODEL_PATH=./data/asr-model
+ASR_MODEL=Systran/faster-whisper-small
 ASR_DEVICE=cpu
 ASR_COMPUTE_TYPE=int8
 ASR_LANGUAGE=ja
@@ -252,7 +253,7 @@ ASR_LANGUAGE=ja
 
 `!ai` または先頭メンションとともに音声を1つ添付すると、文字起こしを質問に加えます。対応拡張子は `.ogg`, `.mp4`, `.webm`, `.mkv`, `.mp3`, `.wav`, `.m4a`, `.aac`, `.flac`, `.opus` です。上限8 MiB。
 
-VCで使う場合は `ASR_ENABLED=true` と `MEMORY_ENABLED=true` にし、Whisperモデルを `data/asr-model/` に配置してBotを再起動します。Docker Composeはこのホストディレクトリを読み取り専用でモデルパスへマウントします。サーバー管理権限のある利用者がVCに入って `/vc_stt_start` を実行すると開始し、`/vc_stt_stop` で停止します。開始時にテキストチャンネルへ告知し、認識結果も同チャンネルへ表示します。BotにはVCへの接続権限が必要です。話者ごとに無音で区切った音声をローカルWhisperで処理し、音声そのものは保存せず、話者ID・VC・日時を付けた文字起こしをRAGへ保存します。RAG検索ではVCと話者で絞り込めます。
+VCで使う場合は `ASR_ENABLED=true` と `MEMORY_ENABLED=true` にし、Botを起動します。Docker Composeの永続データ領域にモデルをキャッシュします。サーバー管理権限のある利用者がVCに入って `/vc_stt_start` を実行すると開始し、`/vc_stt_stop` で停止します。開始時にテキストチャンネルへ告知し、認識結果も同チャンネルへ表示します。BotにはVCへの接続権限が必要です。話者ごとに無音で区切った音声をローカルWhisperで処理し、音声そのものは保存せず、話者ID・VC・日時を付けた文字起こしをRAGへ保存します。RAG検索ではVCと話者で絞り込めます。
 
 音声受信には [Discord DAVE対応の `discord-ext-voice-recv` fork](https://github.com/rdphillips7/discord-ext-voice-recv) をcommit固定で使います。受信拡張はalpha版なので、依存更新時はDiscordの音声プロトコル変更との互換性も確認してください。
 

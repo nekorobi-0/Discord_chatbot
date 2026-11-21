@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import os
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -99,6 +98,12 @@ class AIKunClient(discord.Client):
         self._register_commands()
 
     async def setup_hook(self) -> None:
+        if self.settings.asr.enabled:
+            try:
+                await self.service.prepare_asr_model()
+                logger.info("ASR model ready: %s", self.settings.asr.model)
+            except Exception as exc:
+                logger.warning("ASR model download/load failed: %s", type(exc).__name__)
         guild = discord.Object(id=self.settings.discord.guild_id)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
@@ -108,9 +113,7 @@ class AIKunClient(discord.Client):
         metrics.increment("ai_kun.discord_connections_total")
         if not self._members_synced:
             try:
-                count = await sync_guild_members(
-                    self.settings.discord.guild_id, self.settings.discord.bot_token
-                )
+                count = await sync_guild_members(self.settings.discord.guild_id, self.settings.discord.bot_token)
                 logger.info("Discord member cache synced: members=%d", count)
                 self._members_synced = True
             except Exception as exc:
@@ -394,8 +397,12 @@ class AIKunClient(discord.Client):
             if not self.settings.memory.enabled:
                 await interaction.response.send_message("RAG記憶が無効です。", ephemeral=True)
                 return
-            if not os.path.isfile(os.path.join(self.settings.asr.model_path, "model.bin")):
-                await interaction.response.send_message("Whisperモデルが見つかりません。", ephemeral=True)
+            try:
+                await self.service.prepare_asr_model()
+            except Exception:
+                await interaction.response.send_message(
+                    "Whisperモデルを取得できませんでした。ネットワークとモデル設定を確認してください。", ephemeral=True
+                )
                 return
             voice_state = getattr(interaction.user, "voice", None)
             channel = getattr(voice_state, "channel", None)
@@ -404,7 +411,9 @@ class AIKunClient(discord.Client):
                 return
             guild = interaction.guild
             if guild.id in self._voice_sessions or guild.id in self._voice_starting:
-                await interaction.response.send_message("このサーバーではVC文字起こしがすでに動いています。", ephemeral=True)
+                await interaction.response.send_message(
+                    "このサーバーではVC文字起こしがすでに動いています。", ephemeral=True
+                )
                 return
             if guild.voice_client is not None:
                 await interaction.response.send_message("Botはすでに別のVCセッションを使用中です。", ephemeral=True)
@@ -418,7 +427,9 @@ class AIKunClient(discord.Client):
 
                 from ..voice_stt import VoiceTranscriptSession
             except ImportError:
-                await interaction.response.send_message("音声受信依存がありません。voice extraを入れてください。", ephemeral=True)
+                await interaction.response.send_message(
+                    "音声受信依存がありません。voice extraを入れてください。", ephemeral=True
+                )
                 return
 
             self._voice_starting.add(guild.id)
@@ -449,7 +460,9 @@ class AIKunClient(discord.Client):
                 current = guild.voice_client
                 if current is not None and current.is_connected():
                     await current.disconnect(force=True)
-                await interaction.followup.send("VCへ接続できませんでした。Botの接続権限を確認してください。", ephemeral=True)
+                await interaction.followup.send(
+                    "VCへ接続できませんでした。Botの接続権限を確認してください。", ephemeral=True
+                )
             finally:
                 self._voice_starting.discard(guild.id)
 
@@ -459,7 +472,9 @@ class AIKunClient(discord.Client):
         async def vc_stt_stop(interaction: discord.Interaction):
             await interaction.response.defer(ephemeral=True)
             if await self._stop_voice_stt(interaction.guild_id):
-                await interaction.followup.send("VC文字起こしを停止しました。未処理分もRAGへ保存しました。", ephemeral=True)
+                await interaction.followup.send(
+                    "VC文字起こしを停止しました。未処理分もRAGへ保存しました。", ephemeral=True
+                )
             else:
                 await interaction.followup.send("VC文字起こしは動いていません。", ephemeral=True)
 

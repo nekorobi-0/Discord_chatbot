@@ -110,6 +110,9 @@ class ChatService:
             raise InvalidInputError("うまく聞こえなかったよ。もう一回話してくれる？")
         return text
 
+    async def prepare_asr_model(self) -> None:
+        await self._memory.prepare_asr_model()
+
     # ---------- 記憶（RAG）----------
     def read_document(
         self,

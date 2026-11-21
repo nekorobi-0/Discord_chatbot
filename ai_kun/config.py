@@ -228,10 +228,11 @@ class EmbeddingSettings:
 
 @dataclass(frozen=True)
 class ASRSettings:
-    """添付音声の文字起こし設定。既定はオフ、モデルはイメージに含めない。"""
+    """添付音声の文字起こし設定。モデルは有効時にHugging Faceから取得する。"""
 
     enabled: bool = False
     model_path: str = "/app/data/asr-model"
+    model: str = "Systran/faster-whisper-small"
     device: str = "cpu"
     compute_type: str = "int8"
     language: str = "ja"
@@ -241,6 +242,7 @@ class ASRSettings:
         return cls(
             enabled=_bool("ASR_ENABLED", False),
             model_path=_raw("ASR_MODEL_PATH") or "/app/data/asr-model",
+            model=_raw("ASR_MODEL") or "Systran/faster-whisper-small",
             device="cuda" if _raw("ASR_DEVICE").lower().startswith("cuda") else "cpu",
             compute_type=_raw("ASR_COMPUTE_TYPE") or "int8",
             language=(_raw("ASR_LANGUAGE") or "ja")[:8],
