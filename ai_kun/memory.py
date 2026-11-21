@@ -805,6 +805,14 @@ class MemoryStore:
                         )
                     )
                 )
+        candidates = await asyncio.to_thread(self._load_search_candidates, conditions, user_id)
+        if not candidates:
+            return ()
+        query_vector = (await self.embed([text]))[0]
+        return await asyncio.to_thread(self._rank_search_candidates, candidates, query_vector, limit)
+
+    @staticmethod
+    def _load_search_candidates(conditions, user_id):
         with Session(get_engine()) as session:
             rows = list(
                 session.exec(
@@ -835,9 +843,9 @@ class MemoryStore:
                 fragment, message_id = _author_fragment(document.content, row.content, spans.get(row.document_id, []))
                 if fragment:
                     candidates.append((row, fragment, message_id))
-        if not candidates:
-            return ()
-        query_vector = (await self.embed([text]))[0]
+        return candidates
+
+    def _rank_search_candidates(self, candidates, query_vector, limit):
         matrix = np.empty((len(candidates), self._embedding.dimension), dtype=np.float32)
         usable = np.zeros(len(candidates), dtype=bool)
         for index, (row, _, _) in enumerate(candidates):
@@ -854,26 +862,39 @@ class MemoryStore:
         ranked = np.argsort(-scores, kind="stable")
         results = []
         seen = set()
+        selected = []
         for score_index in ranked.tolist():
             if scores[score_index] < self._memory.min_score:
                 continue
             row, fragment, message_id = candidates[int(positions[score_index])]
-            if (row.document_id, fragment) in seen:
+            key = (row.document_id, fragment)
+            if key in seen:
                 continue
-            seen.add((row.document_id, fragment))
-            with Session(get_engine()) as session:
-                origin_query = select(HistoryMessageRecord).where(HistoryMessageRecord.document_id == row.document_id)
-                if message_id is not None:
-                    origin_query = origin_query.where(HistoryMessageRecord.message_id == message_id)
-                origin = session.exec(origin_query).first()
+            seen.add(key)
+            selected.append((row, fragment, message_id))
+            if len(selected) >= limit:
+                break
+        if not selected:
+            return ()
+        document_ids = {row.document_id for row, _, _ in selected}
+        with Session(get_engine()) as session:
+            origins = list(
+                session.exec(select(HistoryMessageRecord).where(HistoryMessageRecord.document_id.in_(document_ids)))
+            )
+        origins_by_document = {}
+        origins_by_message = {}
+        for origin in origins:
+            origins_by_document.setdefault(origin.document_id, origin)
+            origins_by_message[(origin.document_id, origin.message_id)] = origin
+        for row, fragment, message_id in selected:
+            origin = origins_by_message.get((row.document_id, message_id)) if message_id is not None else None
+            origin = origin or origins_by_document.get(row.document_id)
             label = f"document:{row.document_id}"
             if origin and origin.message_id.startswith("voice:"):
                 label += f" voice channel:{origin.channel_id}"
             elif origin:
                 label += f" https://discord.com/channels/{origin.guild_id}/{origin.channel_id}/{origin.message_id}"
             results.append(RetrievedChunk(label=label, text=fragment))
-            if len(results) >= limit:
-                break
         return tuple(results)
 
     async def delete_document(self, document_id: str) -> int:
