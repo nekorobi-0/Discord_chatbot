@@ -98,15 +98,24 @@ class AIKunClient(discord.Client):
         self._register_commands()
 
     async def setup_hook(self) -> None:
-        if self.settings.asr.enabled:
-            try:
-                await self.service.prepare_asr_model()
-                logger.info("ASR model ready: %s", self.settings.asr.model)
-            except Exception as exc:
-                logger.warning("ASR model download/load failed: %s", type(exc).__name__)
         guild = discord.Object(id=self.settings.discord.guild_id)
         self.tree.copy_global_to(guild=guild)
-        await self.tree.sync(guild=guild)
+        synced = await self.tree.sync(guild=guild)
+        logger.info(
+            "Discord guild commands synced: guild_id=%s count=%d commands=%s",
+            self.settings.discord.guild_id,
+            len(synced),
+            ",".join(command.name for command in synced),
+        )
+        if self.settings.asr.enabled:
+            asyncio.create_task(self._prepare_asr_model())
+
+    async def _prepare_asr_model(self) -> None:
+        try:
+            await self.service.prepare_asr_model()
+            logger.info("ASR model ready: %s", self.settings.asr.model)
+        except Exception as exc:
+            logger.warning("ASR model download/load failed: %s", type(exc).__name__)
 
     async def on_ready(self) -> None:
         logger.info("Discord connected; configured guild commands ready")
