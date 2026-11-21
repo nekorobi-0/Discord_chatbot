@@ -24,6 +24,7 @@ from ..observability import metrics
 from ..request_diagnostics import RequestTrace, current_trace, phase
 from ..streaming import current_text_update
 from ..text_files import FILE_TOKEN_LIMIT
+from ..voice_transcript_stream import VoiceTranscriptStream
 from ..work_queue import WorkQueue
 from .reply_chain import collect_reply_chain, resolve_reply
 from .stream_reply import StreamReply
@@ -90,6 +91,7 @@ class AIKunClient(discord.Client):
         self._voice_sessions = {}
         self._voice_starting: set[int] = set()
         self._voice_tts_locks: dict[int, asyncio.Lock] = {}
+        self.voice_transcripts = VoiceTranscriptStream()
         self._voice_notice_channels = {}
         self._message_tasks: set[asyncio.Task] = set()
         self._history_tasks: set[asyncio.Task] = set()
@@ -456,6 +458,16 @@ class AIKunClient(discord.Client):
                 async def announce_transcript(author: dict, text: str):
                     name = author.get("nick") or author.get("global_name") or author.get("username") or "メンバー"
                     name = str(name).replace("@", "@\u200b")[:80]
+                    self.voice_transcripts.publish(
+                        {
+                            "guild_id": str(guild.id),
+                            "channel_id": str(channel.id),
+                            "author_id": str(author.get("id", "")),
+                            "author_name": name,
+                            "timestamp": discord.utils.utcnow().isoformat(),
+                            "text": text,
+                        }
+                    )
                     for part in split_message(text):
                         await notice_channel.send(
                             f"🎙️ **{name}**: {part}", allowed_mentions=discord.AllowedMentions.none()
